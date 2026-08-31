@@ -45,6 +45,8 @@
 /tests/test_linux_memory
 /tests/test_rocm_memory
 /tests/test_deepseek4_vision_image
+/tests/test_qwen4_host
+/tests/test_qwen4_metal
 *.o
 *.dSYM/
 __pycache__/
