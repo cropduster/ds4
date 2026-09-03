@@ -7821,7 +7821,6 @@ kernel void kernel_mul_mm_id_map0(
 
 typedef decltype(kernel_mul_mm_id_map0<1>) kernel_mul_mm_id_map0_t;
 
-
 // Host-visible map builders for the routed-expert counts used by DS4 graph
 // shapes. Some arities are generic leftovers retained for nearby batch sizes.
 template [[host_name("kernel_mul_mm_id_map0_ne20_1" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<1>;
@@ -7960,8 +7959,8 @@ kernel void kernel_mul_mm_id(
     const int r0 = tgpig.y*NR0;
     const int r1 = (int)item.y;
 
-    device const uint32_t * tpe_u32 = (device const uint32_t *) htpe;
-    device const int32_t  * ids_i32 = (device const int32_t  *) hids;
+    device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
+    device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
 
     const int32_t neh1 = tpe_u32[im];
 
@@ -8003,20 +8002,21 @@ kernel void kernel_mul_mm_id(
 
     short il = il0;
 
-    const short iy = 8*(tiitg % NL1);
-
-    const uint64_t offset0 =
-        (uint64_t)(im - args.tp_expert_base)*args.nb02;
-    const short    offset1 = il0/nl;
-
-    device const block_q * x = (device const block_q *)(src0 + args.nb01*(r0 + lr0) + offset0) + offset1;
-
     const int id = ids_i32[im*args.ne21 + r1 + lr1];
 
     const short i11 = (id % args.ne20) % args.ne11;
     const short i12 = (id / args.ne20);
+    const short i13 = 0;
+
+    const uint64_t offset0 = (uint64_t)(im - args.tp_expert_base)*args.nb02 + i13*args.nb03;
+    const short    offset1 = il0/nl;
+
+    device const block_q * x = (device const block_q *)(src0 + args.nb01*(r0 + lr0) + offset0) + offset1;
+
+    const short iy = 8*(tiitg % NL1);
 
     device const T1 * y = (device const T1 *)(src1
+        + args.nb13*i13
         + args.nb12*i12
         + args.nb11*i11
         + args.nb10*iy);
@@ -8854,10 +8854,6 @@ template [[host_name("kernel_mul_mm_id_addr_q2_K_f16")]]    kernel mul_mm_id_add
 template [[host_name("kernel_mul_mm_id_addr_q4_K_f16")]]    kernel mul_mm_id_addr_f16_rhs kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_addr_mxfp4_f16")]]   kernel mul_mm_id_addr_f16_rhs kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mxfp4, 2, dequantize_mxfp4, half, half4x4, half, half2x4>;
 
-// Qwen3.8 routed Q4_0 experts share the standard GGML nibble layout with the
-// dense block decoder, so the generic mapped grouped matmul covers them.
-template [[host_name("kernel_mul_mm_id_q4_0_f32")]]         kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float, float2x4>;
-
 #ifdef DS4_METAL_HAS_TENSOR
 // Attention-output low-rank projection retained for Metal4 prefill. It uses
 // the same direct-RHS idea as dense matmul: dequantize the Q8_0 or Q4_K low
@@ -9111,16 +9107,15 @@ kernel void kernel_mul_mm_id_mpp(
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    threadgroup S0 * sa = (threadgroup S0 *)(shmem);
+    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 4096);
+    threadgroup float *sc = (threadgroup float *)shmem;
+
     constexpr int NR0 = 64;
     constexpr int NR1 = 32;
     constexpr int NK  = 32;
     constexpr int NL0 = NK/16;
     constexpr int NL1 = NK/8;
-    constexpr int SA_BYTES = NK * NR0 * (int)sizeof(S0);
-
-    threadgroup S0 * sa = (threadgroup S0 *)(shmem);
-    threadgroup S1 * sb = (threadgroup S1 *)(shmem + SA_BYTES);
-    threadgroup float *sc = (threadgroup float *)shmem;
 
     device const uint32_t *work_count = (device const uint32_t *)work;
     const uint32_t work_index = tgpig.x;
@@ -9303,26 +9298,6 @@ template [[host_name("kernel_mul_mm_id_q2_K_f16_mpp")]]    kernel mul_mm_id_mpp_
 template [[host_name("kernel_mul_mm_id_iq2_xxs_f16_mpp")]] kernel mul_mm_id_mpp_f16_rhs_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_mxfp4_f32_mpp")]]   kernel mul_mm_id_mpp_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mxfp4, 2, dequantize_mxfp4, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_mxfp4_f16_mpp")]]   kernel mul_mm_id_mpp_f16_rhs_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mxfp4, 2, dequantize_mxfp4, half, half4x4, half, half2x4>;
-
-// Qwen3.8-Flash-Next routed experts on the same MPP pipeline.  The v3
-// standard pack routes Q4_K, the Q4_0-routed standard variant routes Q4_0
-// (both 18-byte rows per 32 logical values), and the v4 mixed-Q2 pack keeps
-// an F32 mid for its Q2_K down projections.  All three share the F32-RHS
-// staging shape of the DeepSeek IQ2_XXS route, so the host can swap them in
-// at the same dispatch geometry as the simdgroup id kernels.
-template [[host_name("kernel_mul_mm_id_q4_0_f32_mpp")]] kernel mul_mm_id_mpp_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float, float2x4>;
-template [[host_name("kernel_mul_mm_id_q4_K_f32_mpp")]]  kernel mul_mm_id_mpp_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K,    QK_NL, dequantize_q4_K,    float, float4x4, float, float2x4>;
-
-/* F32-staged MPP variants of the Qwen3.8 routed experts, mirroring the
- * iq2_xxs/q2_K f32stage arms on exp/m5-tensor-precision: same TensorOps
- * route, but both operand tiles are staged as fp32 instead of binary16
- * (measured there at ~2.5x tighter rms vs the exact CPU f32 reference).
- * Quality route, not a speed route; selected via DS4_METAL_MPP_MOE_F32STAGE
- * or DS4_QWEN4_MOE_MUL_MM_ID_F32STAGE with the 12 KiB tile budget. */
-typedef decltype(kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4>) qwen_mul_mm_id_mpp_f32stage_t;
-
-template [[host_name("kernel_mul_mm_id_q4_0_f32_mpp_f32stage")]] kernel qwen_mul_mm_id_mpp_f32stage_t kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, ds4_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float, float2x4>;
-template [[host_name("kernel_mul_mm_id_q4_K_f32_mpp_f32stage")]]  kernel qwen_mul_mm_id_mpp_f32stage_t kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q4_K,    QK_NL, dequantize_q4_K,    float, float4x4, float, float2x4>;
 
 typedef decltype(kernel_attn_out_low_mpp_direct_rhs<
         block_q8_0, 2, dequantize_q8_0_pairs, 64>)

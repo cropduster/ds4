@@ -21,7 +21,7 @@ static void die(const char *msg) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "usage: %s MODEL manifest.tsv OUT.tsv [ctx] [--ple FILE] "
+            "usage: %s MODEL manifest.tsv OUT.tsv [ctx] "
             "[--quality] [--rendered-prompt] "
             "[--gpu-vram N[,N,...]|auto] [--gpu-devices N[,N,...]] "
             "[--cuda-tensor-parallel] "
@@ -583,7 +583,6 @@ int main(int argc, char **argv) {
     const char *model_path = argv[1];
     const char *manifest_path = argv[2];
     const char *out_path = argv[3];
-    const char *ple_path = NULL;
     int ctx_size = 4096;
     bool ctx_set = false;
     bool quality = false;
@@ -626,8 +625,6 @@ int main(int argc, char **argv) {
             quality = true;
         } else if (!strcmp(arg, "--rendered-prompt")) {
             rendered_prompt = true;
-        } else if (!strcmp(arg, "--ple")) {
-            ple_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--gpu-vram")) {
             gpu_vram_arg = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--gpu-devices")) {
@@ -677,7 +674,6 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = model_path,
-        .ple_path = ple_path,
 #ifdef __APPLE__
         .backend = DS4_BACKEND_METAL,
 #else
