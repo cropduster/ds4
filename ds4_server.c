@@ -19583,8 +19583,13 @@ static void test_canonical_image_markers_keep_literal_text_exact(void) {
 
     server_image_inputs images = {0};
     char first[SERVER_IMAGE_MARKER_BYTES], second[SERVER_IMAGE_MARKER_BYTES];
-    TEST_ASSERT(server_image_inputs_push_base64(&images, "image/png", "eA==", first));
-    TEST_ASSERT(server_image_inputs_push_base64(&images, "image/png", "eA==", second));
+    /* Minimal valid 1x1 PNG: the push path sniffs the real format and
+     * rejects placeholder bytes. */
+    const char *tiny_png =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAC"
+        "hwGA60e6kgAAAABJRU5ErkJggg==";
+    TEST_ASSERT(server_image_inputs_push_base64(&images, "image/png", tiny_png, first));
+    TEST_ASSERT(server_image_inputs_push_base64(&images, "image/png", tiny_png, second));
     char prefix[256], replay[256], changed[256];
     snprintf(prefix, sizeof(prefix), "%s literal %s end", first, literal_a);
     snprintf(replay, sizeof(replay), "%s literal %s end next", second, literal_a);
@@ -19995,6 +20000,8 @@ static void test_token_text_cache_retry_control_flow(void) {
     TEST_ASSERT(p.load_calls == 1);
     TEST_ASSERT(p.render_calls == 0);
     TEST_ASSERT(!strcmp(p.seen[0], "raw"));
+}
+
 static void test_vision_kv_key_requires_exact_image_identity(void) {
     const int embd = ds4_engine_embd_dim(NULL);
     TEST_ASSERT(embd > 0);
