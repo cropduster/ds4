@@ -78,9 +78,11 @@ other batches and devices retain two rows and two SIMD groups.
 See [the MTP decode benchmark](../speed-bench/qwen38-mtp-decode.md) for measurements
 and reproduction commands. The [earlier 262K comparison](../speed-bench/qwen38-262k-compare.md)
 found decode drift in the previous Q4_K optimization. The current gate/up kernel
-preserves the original accumulation order and matches all 896 recorded FP32
-decode logit vectors through 262K; see the [latest non-MTP benchmark](../speed-bench/qwen38-nonmtp-round3.md)
-for performance, numerical checks, and their limits. The
+preserves the original accumulation order. Before the main rebase, it matched
+all 896 recorded FP32 decode logit vectors through 262K; see the
+[non-MTP benchmark](../speed-bench/qwen38-nonmtp-round3.md) for those measurements.
+The [rebase validation](../speed-bench/qwen38-main-rebase.md) matched 256 full
+vectors through 8K and preserved the tested MTP outputs; it did not rerun 262K. The
 [previous round](../speed-bench/qwen38-nonmtp-decode.md) records the numerical correction.
 
 The trunk submits commands after two layers to overlap GPU execution with host
@@ -102,9 +104,9 @@ card's levels (`chat_template_kwargs` with `enable_thinking` and
 alias disables thinking and `qwen3.8-flash-next-reasoner` forces it. Tool
 calls use the model's native `<tool_call><function=...><parameter=...>` format
 in both the server and the agent. Disk KV checkpoints and live prefix reuse
-work as for the other models; the recurrent state travels with the checkpoint,
-so a session cannot be rewound to an arbitrary earlier position and a shorter
-prompt is prefilled again.
+work as for the other models; the recurrent state travels with the checkpoint.
+Rewinding to an arbitrary earlier position resets that state and replays the
+kept token prefix on the next evaluation. A shorter prompt is prefilled again.
 
 The model's native window is 262144 tokens. For longer prompts set
 `DS4_QWEN4_YARN_FACTOR=4`, which

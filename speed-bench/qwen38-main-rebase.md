@@ -2,7 +2,7 @@
 
 The branch was rebased from `1bf4842` onto main `9ab7053` on the M3 Ultra
 with 512 GiB RAM. The tested runtime is `927d845`; the following documentation
-commit does not change runtime code. The original branch was 21 commits behind
+commits do not change runtime code. The original branch was 21 commits behind
 and 37 ahead. Replaying its non-merge commits and removing three duplicate
 patches leaves 30 commits above main.
 
