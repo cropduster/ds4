@@ -47228,6 +47228,9 @@ enum {
     QWEN4_K_HC_NORM_F16 = 0,
     QWEN4_K_HC_NORM_F32,
     QWEN4_K_HC_NORM_Q8,
+    QWEN4_K_HC_NORM_REUSE_F16,
+    QWEN4_K_HC_NORM_REUSE_F32,
+    QWEN4_K_HC_NORM_REUSE_Q8,
     QWEN4_K_HC_GATE_MIX_F16,
     QWEN4_K_HC_GATE_MIX_F32,
     QWEN4_K_HC_GATE_MIX_Q8,
@@ -47259,6 +47262,7 @@ enum {
     QWEN4_K_ATTN_MM,
     QWEN4_K_MOE_MID,
     QWEN4_K_MOE_MID_Q4K,
+    QWEN4_K_MOE_MID_Q4K_NR1,
     QWEN4_K_MOE_DOWN,
     QWEN4_K_MOE_REDUCE,
     QWEN4_K_MTP_STAGE,
@@ -47283,6 +47287,9 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_hc_norm_f16",
     "kernel_qwen4_hc_norm_f32",
     "kernel_qwen4_hc_norm_q8",
+    "kernel_qwen4_hc_norm_reuse_f16",
+    "kernel_qwen4_hc_norm_reuse_f32",
+    "kernel_qwen4_hc_norm_reuse_q8",
     "kernel_qwen4_hc_gate_mix_f16",
     "kernel_qwen4_hc_gate_mix_f32",
     "kernel_qwen4_hc_gate_mix_q8",
@@ -47314,6 +47321,7 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_attn_mm",
     "kernel_qwen4_moe_mid",
     "kernel_qwen4_moe_mid_q4k",
+    "kernel_qwen4_moe_mid_q4k_nr1",
     "kernel_qwen4_moe_down",
     "kernel_qwen4_moe_reduce",
     "kernel_qwen4_mtp_stage",
@@ -47413,9 +47421,23 @@ int ds4_gpu_qwen4_hc_norm_tensor(
         b[2] = b[1];
         b[4] = b[3];
     }
-    const int kernel = qwen4_hc_kernel(weight_type, QWEN4_K_HC_NORM_F16, QWEN4_K_HC_NORM_F32, QWEN4_K_HC_NORM_Q8);
+    /* Reuse wins at the measured large prefill shape. Decode and MTP keep
+     * the original chunk parallelism, including with an explicit override. */
+    bool reuse = false;
+    if (n_tokens > 2u) {
+        const char *reuse_env = getenv("DS4_QWEN4_HC_NORM_REUSE");
+        if (reuse_env != NULL && strcmp(reuse_env, "1") == 0) {
+            reuse = true;
+        } else if (reuse_env == NULL || strcmp(reuse_env, "0") != 0) {
+            reuse = n_tokens >= 8192u && n_embd == 2560u && n_hc == 4u && n_inject == 4u &&
+                    ds4_gpu_device_name_contains("M3 Ultra");
+        }
+    }
+    const int kernel = reuse
+        ? qwen4_hc_kernel(weight_type, QWEN4_K_HC_NORM_REUSE_F16, QWEN4_K_HC_NORM_REUSE_F32, QWEN4_K_HC_NORM_REUSE_Q8)
+        : qwen4_hc_kernel(weight_type, QWEN4_K_HC_NORM_F16, QWEN4_K_HC_NORM_F32, QWEN4_K_HC_NORM_Q8);
     return qwen4_dispatch(kernel, &args, sizeof(args), b, 5,
-                          MTLSizeMake(n_hc * DS4_QWEN4_HC_CHUNKS, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
+                          MTLSizeMake(reuse ? n_hc : n_hc * DS4_QWEN4_HC_CHUNKS, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
 }
 
 int ds4_gpu_qwen4_hc_gate_mix_tensor(
@@ -47902,10 +47924,18 @@ int ds4_gpu_qwen4_moe_mid_tensor(
         b[6] = b[1];
     }
     const bool q4k = weight_type == 12u && getenv("DS4_QWEN4_NO_Q4K_MID") == NULL;
+    const bool m3_ultra = q4k && ds4_gpu_device_name_contains("M3 Ultra");
+    /* The NR1 gain was measured for one-token decode; retain NR2 for T2
+     * MTP verification and other batches unless explicitly overridden. */
+    const uint32_t default_nr = m3_ultra && n_tokens == 1u ? 1u : 2u;
+    const uint64_t nr_env = q4k ? ds4_gpu_env_u64("DS4_QWEN4_Q4K_MID_NR", default_nr, 1u, UINT64_MAX) : 2u;
+    const uint32_t nr = nr_env == 1u || nr_env == 2u ? (uint32_t)nr_env : default_nr;
+    /* NR2 without an NSG override restores the former ordered dispatch. */
+    const uint32_t default_nsg = m3_ultra && nr == 1u ? 8u : 2u;
     const uint32_t nsg = q4k ?
-        (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_Q4K_MID_NSG", 2u, 1u, 8u) : 4u;
-    const uint32_t rows_per_tg = 2u * nsg;
-    const int kernel = q4k ? QWEN4_K_MOE_MID_Q4K : QWEN4_K_MOE_MID;
+        (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_Q4K_MID_NSG", default_nsg, 1u, 8u) : 4u;
+    const uint32_t rows_per_tg = nr * nsg;
+    const int kernel = !q4k ? QWEN4_K_MOE_MID : nr == 1u ? QWEN4_K_MOE_MID_Q4K_NR1 : QWEN4_K_MOE_MID_Q4K;
     return qwen4_dispatch(kernel, &args, sizeof(args), b, 7,
                           MTLSizeMake((ff_dim + rows_per_tg - 1) / rows_per_tg, n_out, n_tokens),
                           MTLSizeMake(32u * nsg, 1, 1), 0);
