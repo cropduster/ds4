@@ -9,6 +9,7 @@ bool ds4_test_dspark_cache_window_crop(void);
 bool ds4_test_multimodal_sync_finish_policy(void);
 bool ds4_test_vision_identity_carries_exact_state_fingerprint(void);
 bool ds4_test_vision_identity_keeps_retained_hash(void);
+bool ds4_test_dspark_prefix_capture(ds4_engine *engine, const ds4_tokens *prompt);
 
 static ds4_engine *test_engine_fast;
 static ds4_engine *test_engine_quality;
@@ -224,6 +225,8 @@ static void test_session_snapshot_roundtrip(void) {
                             "Give one concise reason to test session restore.");
     ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
     TEST_ASSERT(prompt.len > 0);
+    fprintf(stderr, "ds4-test: snapshot prompt=%d ctx=%u glm_mtp=%d\n",
+            prompt.len, ctx, test_glm_mtp);
     TEST_ASSERT(ds4_session_sync(reference, &prompt, err, sizeof(err)) == 0);
     TEST_ASSERT(ds4_session_top_logprobs(reference, before, 8) == 8);
     TEST_ASSERT(ds4_session_save_snapshot(reference, &snapshot,
@@ -6781,6 +6784,8 @@ static void test_dspark_verify_depth(void) {
         ds4_chat_append_message(engine, &prompt, "user", test_mtp_copy_prompt());
         ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
         TEST_ASSERT(prompt.len > 0);
+
+        TEST_ASSERT(ds4_test_dspark_prefix_capture(engine, &prompt));
 
         spec = malloc((size_t)TEST_DSPARK_MAXGEN * sizeof(*spec));
         TEST_ASSERT(spec != NULL);
