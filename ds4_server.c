@@ -13094,7 +13094,8 @@ decode_again:
             }
         }
         if (stop_decode) {
-            if (kept < ntok && !text_stop && !job_cancelled(j)) {
+            if (kept < ntok && !text_stop && !job_cancelled(j) &&
+                ds4_engine_is_glm_dsa(s->engine)) {
                 int pos = block_start + kept;
                 pthread_mutex_lock(&s->inference_mu);
                 ds4_session_rewind(slot->session, pos);
