@@ -163,6 +163,7 @@ tests/test_argsort_metal: tests/test_argsort_metal.o ds4_metal.o ds4_image.o
 test-argsort-metal: tests/test_argsort_metal
 	./tests/test_argsort_metal
 
+tests/test_metal_moe_prefill.o: tests/test_metal_moe_prefill.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
 
 tests/test_metal_moe_prefill: tests/test_metal_moe_prefill.o $(CORE_OBJS)
