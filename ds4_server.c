@@ -3,7 +3,6 @@
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
-#include "ds4_image.h"
 #include "ds4_kvstore.h"
 #include "ds4_tp.h"
 #include "rax.h"
@@ -42,10 +41,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#ifndef DS4_VERSION
-#define DS4_VERSION "unknown"
-#endif
-
 static volatile sig_atomic_t g_stop_requested = 0;
 static volatile sig_atomic_t g_listen_fd = -1;
 
@@ -54,11 +49,8 @@ static volatile sig_atomic_t g_listen_fd = -1;
 
 #if defined(__GNUC__) || defined(__clang__)
 #define DS4_SERVER_MAYBE_UNUSED __attribute__((unused))
-#define DS4_SERVER_PRINTF(fmt, args) \
-    __attribute__((format(printf, fmt, args)))
 #else
 #define DS4_SERVER_MAYBE_UNUSED
-#define DS4_SERVER_PRINTF(fmt, args)
 #endif
 
 static void stop_signal_handler(int sig) {
@@ -451,17 +443,10 @@ typedef struct {
     size_t encoded_len;
 } server_image_input;
 
-#define SERVER_IMAGE_ERROR_BYTES 224
-
 typedef struct {
     server_image_input *v;
     size_t len;
     size_t cap;
-    /* Why the last rejected image block was refused.  Image blocks are parsed
-     * deep inside the JSON walkers, which can only report a boolean, so the
-     * request parsers would otherwise collapse every bad image into a generic
-     * "invalid JSON request" and leave the client with nothing to act on. */
-    char error[SERVER_IMAGE_ERROR_BYTES];
 } server_image_inputs;
 
 static void server_image_inputs_free(server_image_inputs *images) {
@@ -471,125 +456,60 @@ static void server_image_inputs_free(server_image_inputs *images) {
     memset(images, 0, sizeof(*images));
 }
 
-DS4_SERVER_PRINTF(2, 3)
-static void server_image_inputs_error(server_image_inputs *images,
-                                      const char *fmt, ...) {
-    if (!images || images->error[0]) return;
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(images->error, sizeof(images->error), fmt, ap);
-    va_end(ap);
-}
-
 static int base64_value(unsigned char c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
     if (c >= 'a' && c <= 'z') return 26 + c - 'a';
     if (c >= '0' && c <= '9') return 52 + c - '0';
-    /* Accept the URL-safe alphabet too: '-' and '_' never appear in standard
-     * base64, so this cannot change how valid standard input decodes. */
-    if (c == '+' || c == '-') return 62;
-    if (c == '/' || c == '_') return 63;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
     return -1;
 }
 
-/* Decode base64 the way real clients emit it: MIME line breaks, indentation,
- * the URL-safe alphabet and omitted '=' padding are all tolerated. */
 static bool server_decode_base64(const char *src, uint8_t **out, size_t *out_len) {
-    if (!src) return false;
-    const size_t n = strlen(src);
-    if (n == 0 || n > 96u * 1024u * 1024u) return false;
-    uint8_t *decoded = xmalloc((n / 4u + 1u) * 3u + 4u);
+    const size_t n = src ? strlen(src) : 0;
+    if (n == 0 || (n & 3u) != 0 || n > 64u * 1024u * 1024u)
+        return false;
+    size_t cap = (n / 4u) * 3u;
+    uint8_t *decoded = xmalloc(cap ? cap : 1);
     size_t used = 0;
-    size_t symbols = 0;
-    uint32_t acc = 0;
-    unsigned bits = 0;
-    bool padded = false;
-    for (size_t i = 0; i < n; i++) {
-        const unsigned char c = (unsigned char)src[i];
-        if (isspace(c)) continue;
-        if (c == '=') {
-            padded = true;
-            continue;
-        }
-        const int v = base64_value(c);
-        if (v < 0 || padded) {
+    for (size_t i = 0; i < n; i += 4) {
+        int a = base64_value((unsigned char)src[i]);
+        int b = base64_value((unsigned char)src[i + 1]);
+        bool pad2 = src[i + 2] == '=';
+        bool pad3 = src[i + 3] == '=';
+        int c = pad2 ? 0 : base64_value((unsigned char)src[i + 2]);
+        int d = pad3 ? 0 : base64_value((unsigned char)src[i + 3]);
+        if (a < 0 || b < 0 || c < 0 || d < 0 ||
+            (pad2 && !pad3) || ((pad2 || pad3) && i + 4 != n)) {
             free(decoded);
             return false;
         }
-        acc = (acc << 6) | (uint32_t)v;
-        bits += 6;
-        symbols++;
-        if (bits >= 8) {
-            bits -= 8;
-            decoded[used++] = (uint8_t)(acc >> bits);
-        }
-    }
-    /* A single trailing symbol encodes no whole byte and cannot occur in a
-     * complete stream, so treat it as corruption rather than silently
-     * truncating. */
-    if (used == 0 || (symbols & 3u) == 1u) {
-        free(decoded);
-        return false;
+        uint32_t bits = ((uint32_t)a << 18) | ((uint32_t)b << 12) |
+                        ((uint32_t)c << 6) | (uint32_t)d;
+        decoded[used++] = (uint8_t)(bits >> 16);
+        if (!pad2) decoded[used++] = (uint8_t)(bits >> 8);
+        if (!pad3) decoded[used++] = (uint8_t)bits;
     }
     *out = decoded;
     *out_len = used;
     return true;
 }
 
-/* The image decoder dispatches on magic bytes and ignores any declared media
- * type, so the media type is only used for diagnostics. */
-static const char *server_image_sniff_format(const uint8_t *b, size_t n) {
-    if (n >= 8 && !memcmp(b, "\x89PNG\r\n\x1a\n", 8)) return "PNG";
-    if (n >= 3 && b[0] == 0xff && b[1] == 0xd8 && b[2] == 0xff) return "JPEG";
-    if (n >= 12 && !memcmp(b, "RIFF", 4) && !memcmp(b + 8, "WEBP", 4))
-        return "WebP";
-    if (n >= 6 && (!memcmp(b, "GIF87a", 6) || !memcmp(b, "GIF89a", 6)))
-        return "GIF";
-    if (n >= 12 && (!memcmp(b + 4, "ftypheic", 8) ||
-                    !memcmp(b + 4, "ftypheix", 8) ||
-                    !memcmp(b + 4, "ftypmif1", 8) ||
-                    !memcmp(b + 4, "ftypavif", 8)))
-        return "HEIC/AVIF";
-    if (n >= 2 && b[0] == 'B' && b[1] == 'M') return "BMP";
-    if (n >= 4 && !memcmp(b, "II*\0", 4)) return "TIFF";
-    if (n >= 4 && !memcmp(b, "MM\0*", 4)) return "TIFF";
-    return NULL;
+static bool server_image_media_type(const char *media_type) {
+    return media_type &&
+           (!strcasecmp(media_type, "image/png") ||
+            !strcasecmp(media_type, "image/jpeg") ||
+            !strcasecmp(media_type, "image/jpg"));
 }
 
 static bool server_image_inputs_push_base64(server_image_inputs *images,
                                             const char *media_type,
                                             const char *base64,
                                             char marker[SERVER_IMAGE_MARKER_BYTES]) {
-    /* Only the family is checked: a client that mislabels a JPEG as
-     * "image/png" still works because decoding sniffs the real format. */
-    if (media_type && media_type[0] &&
-        strncasecmp(media_type, "image/", 6) != 0 &&
-        strcasecmp(media_type, "application/octet-stream") != 0) {
-        server_image_inputs_error(images,
-                                  "image media type \"%s\" is not an image; "
-                                  "send a JPEG or PNG", media_type);
-        return false;
-    }
+    if (!server_image_media_type(media_type)) return false;
     server_image_input image = {0};
-    if (!server_decode_base64(base64, &image.encoded, &image.encoded_len)) {
-        server_image_inputs_error(images,
-                                  "image data is not valid base64");
+    if (!server_decode_base64(base64, &image.encoded, &image.encoded_len))
         return false;
-    }
-    const char *format =
-        server_image_sniff_format(image.encoded, image.encoded_len);
-    if (!format || (strcmp(format, "PNG") && strcmp(format, "JPEG"))) {
-        if (format)
-            server_image_inputs_error(images,
-                                      "%s images are not supported; "
-                                      "send a JPEG or PNG", format);
-        else
-            server_image_inputs_error(images,
-                                      "image data is not a JPEG or PNG "
-                                      "(decoded %zu bytes)", image.encoded_len);
-        free(image.encoded);
-        return false;
-    }
     unsigned char nonce[12];
     if (!random_bytes(nonce, sizeof(nonce))) {
         uint64_t fallback = (uint64_t)time(NULL) ^
@@ -617,61 +537,23 @@ static bool server_image_inputs_push_base64(server_image_inputs *images,
     return true;
 }
 
-/* Parse an RFC 2397 data URI: "data:" [media-type] *(";" parameter) ";base64"
- * "," payload.  Matching a fixed set of literal prefixes is not enough,
- * because clients legitimately vary the case of the scheme and media type and
- * insert parameters such as ";charset=utf-8" before ";base64". */
 static bool server_image_inputs_push_data_uri(
         server_image_inputs *images, const char *uri,
         char marker[SERVER_IMAGE_MARKER_BYTES]) {
-    if (!uri || !uri[0]) {
-        server_image_inputs_error(images, "image_url is missing a url");
-        return false;
-    }
-    if (strncasecmp(uri, "data:", 5) != 0) {
-        /* Fetching remote URLs would let a request drive outbound traffic from
-         * the server, and reading local paths would expose the host
-         * filesystem, so the client must inline the bytes. */
-        server_image_inputs_error(
-            images,
-            "image_url must be an inline base64 data URI such as "
-            "\"data:image/jpeg;base64,...\"; the server does not fetch "
-            "remote URLs or read local file paths");
-        return false;
-    }
-
-    const char *meta = uri + 5;
-    const char *comma = strchr(meta, ',');
-    if (!comma) {
-        server_image_inputs_error(images,
-                                  "image data URI is missing the \",\" that "
-                                  "separates the header from the payload");
-        return false;
-    }
-
-    char media_type[128] = {0};
-    bool base64 = false;
-    for (const char *seg = meta; seg < comma;) {
-        const char *end = memchr(seg, ';', (size_t)(comma - seg));
-        if (!end || end > comma) end = comma;
-        const size_t len = (size_t)(end - seg);
-        if (seg == meta) {
-            if (len && len < sizeof(media_type)) memcpy(media_type, seg, len);
-        } else if (len == 6 && !strncasecmp(seg, "base64", 6)) {
-            base64 = true;
-        }
-        seg = (end < comma) ? end + 1 : comma;
-    }
-
-    if (!base64) {
-        server_image_inputs_error(
-            images,
-            "image data URI must be base64 encoded (expected \";base64,\" "
-            "before the payload)");
-        return false;
-    }
-    return server_image_inputs_push_base64(images, media_type, comma + 1,
-                                           marker);
+    static const char png[] = "data:image/png;base64,";
+    static const char jpeg[] = "data:image/jpeg;base64,";
+    static const char jpg[] = "data:image/jpg;base64,";
+    if (!uri) return false;
+    if (!strncmp(uri, png, sizeof(png) - 1))
+        return server_image_inputs_push_base64(
+            images, "image/png", uri + sizeof(png) - 1, marker);
+    if (!strncmp(uri, jpeg, sizeof(jpeg) - 1))
+        return server_image_inputs_push_base64(
+            images, "image/jpeg", uri + sizeof(jpeg) - 1, marker);
+    if (!strncmp(uri, jpg, sizeof(jpg) - 1))
+        return server_image_inputs_push_base64(
+            images, "image/jpg", uri + sizeof(jpg) - 1, marker);
+    return false;
 }
 
 static void append_owned_text(char **dst, const char *text) {
@@ -680,56 +562,6 @@ static void append_owned_text(char **dst, const char *text) {
     buf_puts(&b, text ? text : "");
     free(*dst);
     *dst = buf_take(&b);
-}
-
-/* Stand in for an image that could not be decoded, so the model is told the
- * image existed instead of answering from the surrounding text as if it had
- * never been sent. */
-#define SERVER_IMAGE_NOTE_BYTES (SERVER_IMAGE_ERROR_BYTES + 24)
-
-static void format_dropped_image_note(char note[SERVER_IMAGE_NOTE_BYTES],
-                                      const char *why) {
-    snprintf(note, SERVER_IMAGE_NOTE_BYTES, "[image omitted: %s]",
-             why && why[0] ? why : "not a supported image");
-}
-
-static void append_dropped_image_note(char **dst, const char *why) {
-    char note[SERVER_IMAGE_NOTE_BYTES];
-    format_dropped_image_note(note, why);
-    append_owned_text(dst, note);
-}
-
-static void text_remove_all(char **s, const char *needle) {
-    if (!s || !*s || !needle || !needle[0]) return;
-    const size_t n = strlen(needle);
-    char *src = *s;
-    buf b = {0};
-    for (const char *q = src;;) {
-        const char *hit = strstr(q, needle);
-        if (!hit) {
-            buf_puts(&b, q);
-            break;
-        }
-        buf_append(&b, q, (size_t)(hit - q));
-        q = hit + n;
-    }
-    free(src);
-    *s = buf_take(&b);
-}
-
-/* Discard decoded images and the markers standing in for them, keeping the
- * diagnostic that rejected them.  Rendering pairs every image with its marker
- * in the prompt text, so a marker left behind would be tokenized as literal
- * junk. */
-static void server_image_inputs_drop(server_image_inputs *images,
-                                     char **content) {
-    if (!images) return;
-    for (size_t i = 0; i < images->len; i++)
-        text_remove_all(content, images->v[i].marker);
-    char saved[SERVER_IMAGE_ERROR_BYTES];
-    snprintf(saved, sizeof(saved), "%s", images->error);
-    server_image_inputs_free(images);
-    snprintf(images->error, sizeof(images->error), "%s", saved);
 }
 
 static bool json_content(const char **p, char **out) {
@@ -866,6 +698,9 @@ static void random_tool_id(char *dst, size_t dstlen, api_style api) {
 typedef struct server server;
 static void server_inference_lock(server *s);
 static void server_inference_unlock(server *s);
+static bool server_encode_image(server *s, const server_image_input *input,
+                                ds4_vision_embedding *out,
+                                char *err, size_t errlen);
 
 typedef struct {
     char *id;
@@ -921,24 +756,7 @@ typedef struct {
     chat_msg *v;
     int len;
     int cap;
-    /* Diagnostic for a rejected content block whose owning message was
-     * discarded before the request-level error was formatted. */
-    char image_error[SERVER_IMAGE_ERROR_BYTES];
 } chat_msgs;
-
-/* Undecodable images are tolerated in the transcript but not in the turn being
- * answered.  A client replays the whole conversation on every request, so one
- * stale image the server cannot read would otherwise reject every later
- * request forever; an image the caller just attached still has to be reported
- * rather than quietly answered from its surrounding text. */
-static bool chat_msgs_newest_image_rejected(chat_msgs *msgs) {
-    if (!msgs || msgs->len <= 0) return false;
-    const chat_msg *last = &msgs->v[msgs->len - 1];
-    if (!last->images.error[0]) return false;
-    snprintf(msgs->image_error, sizeof(msgs->image_error), "%s",
-             last->images.error);
-    return true;
-}
 
 static void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
                                            tool_replay_stats *stats);
@@ -965,12 +783,8 @@ typedef struct {
     server_model_syntax model_syntax;
     ds4_tokens prompt;
     ds4_vision_span *images;
+    char (*image_markers)[SERVER_IMAGE_MARKER_BYTES];
     size_t image_count;
-    /* A stable, non-model copy of prompt_text used only to bind a live
-     * multimodal continuation.  The parser gives each incoming data URL a
-     * fresh private marker, so prompt_text itself cannot be compared across
-     * two otherwise identical image requests. */
-    char *visible_prompt_text;
     char *model;
     bool model_from_request;
     stop_list stops;
@@ -1080,24 +894,6 @@ static void chat_msgs_free(chat_msgs *msgs) {
     memset(msgs, 0, sizeof(*msgs));
 }
 
-/* Report why a request was rejected, preferring a specific image diagnostic
- * over the generic parse failure. Must be called before the messages are
- * freed. */
-static void chat_msgs_request_error(const chat_msgs *msgs, char *err,
-                                    size_t errlen) {
-    if (msgs && msgs->image_error[0]) {
-        snprintf(err, errlen, "%s", msgs->image_error);
-        return;
-    }
-    for (int i = 0; msgs && i < msgs->len; i++) {
-        if (msgs->v[i].images.error[0]) {
-            snprintf(err, errlen, "%s", msgs->v[i].images.error);
-            return;
-        }
-    }
-    snprintf(err, errlen, "invalid JSON request");
-}
-
 static void chat_msgs_push(chat_msgs *msgs, chat_msg msg) {
     if (msgs->len == msgs->cap) {
         msgs->cap = msgs->cap ? msgs->cap * 2 : 8;
@@ -1188,7 +984,7 @@ static void request_free(request *r) {
     for (size_t i = 0; i < r->image_count; i++)
         ds4_vision_embedding_free(&r->images[i].embedding);
     free(r->images);
-    free(r->visible_prompt_text);
+    free(r->image_markers);
     free(r->model);
     for (int i = 0; i < r->stops.len; i++) free(r->stops.v[i]);
     free(r->stops.v);
@@ -1349,13 +1145,7 @@ static const char *server_model_id_from_engine(ds4_engine *engine) {
            "deepseek-v4-pro" : "deepseek-v4-flash";
 }
 
-/* The vision-tagged aliases exist only to stop clients from stripping image
- * input, so they must not appear unless an encoder is actually loaded:
- * advertising them on a text-only server would invite images it cannot read. */
-static bool server_model_alias_known(const char *id, bool vision) {
-    if (id && (!strcmp(id, "deepseek-v4-flash-vision") ||
-               !strcmp(id, "deepseek-v4-pro-vision")))
-        return vision;
+static bool server_model_alias_known(const char *id) {
     return id &&
            (!strcmp(id, "deepseek-v4-flash") ||
             !strcmp(id, "deepseek-v4-pro") ||
@@ -2127,24 +1917,11 @@ static bool parse_openai_content_object(const char **p, chat_msg *msg) {
     if (**p != '}') goto bad;
     (*p)++;
 
-    /* An untyped block carrying an image_url is an image: dropping it would
-     * answer the prompt from the text alone as if no image had been sent. */
-    const bool is_image = image_url && (!type ||
-                                        !strcmp(type, "image_url") ||
-                                        !strcmp(type, "input_image") ||
-                                        !strcmp(type, "image"));
-    if (is_image) {
+    if (type && (!strcmp(type, "image_url") || !strcmp(type, "input_image"))) {
         char marker[SERVER_IMAGE_MARKER_BYTES];
-        if (server_image_inputs_push_data_uri(&msg->images, image_url, marker))
-            append_owned_text(&msg->content, marker);
-        else
-            append_dropped_image_note(&msg->content, msg->images.error);
-    } else if (type && (!strcmp(type, "image_url") ||
-                        !strcmp(type, "input_image"))) {
-        server_image_inputs_error(&msg->images,
-                                  "content block of type \"%s\" has no "
-                                  "image_url", type);
-        append_dropped_image_note(&msg->content, msg->images.error);
+        if (!server_image_inputs_push_data_uri(&msg->images, image_url, marker))
+            goto bad;
+        append_owned_text(&msg->content, marker);
     } else if (text) {
         append_owned_text(&msg->content, text);
     }
@@ -2257,13 +2034,7 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
         (*p)++;
         if (!msg.role) msg.role = xstrdup("user");
         if (!msg.content) msg.content = xstrdup("");
-        if (msg.images.len && strcmp(msg.role, "user")) {
-            server_image_inputs_error(&msg.images,
-                                      "images are only accepted on \"user\" "
-                                      "messages, not \"%s\"", msg.role);
-            server_image_inputs_drop(&msg.images, &msg.content);
-            append_dropped_image_note(&msg.content, msg.images.error);
-        }
+        if (msg.images.len && strcmp(msg.role, "user")) goto fail;
         chat_msgs_push(msgs, msg);
         memset(&msg, 0, sizeof(msg));
         json_ws(p);
@@ -2271,17 +2042,11 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
         json_ws(p);
         continue;
 fail:
-        /* The message that owns the diagnostic is about to be freed, so lift
-         * it to the conversation for the request-level error. */
-        if (msg.images.error[0] && !msgs->image_error[0])
-            snprintf(msgs->image_error, sizeof(msgs->image_error), "%s",
-                     msg.images.error);
         chat_msg_free(&msg);
         return false;
     }
     if (**p != ']') return false;
     (*p)++;
-    if (chat_msgs_newest_image_rejected(msgs)) return false;
     return true;
 }
 
@@ -2330,12 +2095,13 @@ static bool parse_anthropic_image_source(const char **p,
     return true;
 }
 
+static bool parse_anthropic_content(const char **p, chat_msg *msg, bool allow_tools);
+
 /* Anthropic content is block-structured, while the engine consumes one compact
  * chat_msg per role.  Parsing collapses text/thinking into strings, converts
  * assistant tool_use blocks to tool_calls, and keeps tool_result blocks as
  * escaped text because DS4 sees tool results in its chat template. */
-static bool parse_anthropic_content_block(const char **p, const char *role, chat_msg *msg) {
-    (void)role;
+static bool parse_anthropic_content_block(const char **p, bool allow_tools, chat_msg *msg) {
     if (**p != '{') return false;
     (*p)++;
     char *type = NULL;
@@ -2390,7 +2156,7 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
                 goto bad;
             }
         } else if (!strcmp(key, "content")) {
-            if (!json_content_replace(p, &tool_result)) {
+            if (!json_raw_value_replace(p, &tool_result)) {
                 free(key);
                 goto bad;
             }
@@ -2417,6 +2183,8 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
      * caller may not know the enclosing role yet while parsing content blocks.
      * Classify protocol blocks by their own "type" field; later rendering and
      * validation use the final message role. */
+    if (!allow_tools && (!type || (strcmp(type, "text") && strcmp(type, "image"))))
+        goto bad;
     if (type && !strcmp(type, "tool_use")) {
         tool_call tc = {0};
         tc.id = id ? xstrdup(id) : NULL;
@@ -2424,37 +2192,36 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
         tc.arguments = input ? xstrdup(input) : xstrdup("{}");
         tool_calls_push(&msg->calls, tc);
     } else if (type && !strcmp(type, "tool_result")) {
+        chat_msg nested = {0};
+        const char *content = tool_result ? tool_result : "\"\"";
+        if (!parse_anthropic_content(&content, &nested, false)) {
+            chat_msg_free(&nested);
+            goto bad;
+        }
         chat_msg_add_tool_call_id(msg, id);
         buf b = {0};
         buf_puts(&b, msg->content ? msg->content : "");
         buf_puts(&b, "<tool_result>");
-        append_tool_result_text(&b, tool_result);
+        append_tool_result_text(&b, nested.content);
         buf_puts(&b, "</tool_result>");
         free(msg->content);
         msg->content = buf_take(&b);
+        if (nested.images.len) {
+            size_t total = msg->images.len + nested.images.len;
+            msg->images.v = xrealloc(msg->images.v, total * sizeof(msg->images.v[0]));
+            memcpy(msg->images.v + msg->images.len, nested.images.v,
+                   nested.images.len * sizeof(msg->images.v[0]));
+            msg->images.len = msg->images.cap = total;
+            nested.images.len = 0;
+        }
+        chat_msg_free(&nested);
     } else if (type && !strcmp(type, "image")) {
         char marker[SERVER_IMAGE_MARKER_BYTES];
-        if (source_type && !strcmp(source_type, "url")) {
-            server_image_inputs_error(
-                &msg->images,
-                "image source type \"url\" is not supported; send "
-                "{\"type\":\"base64\",\"media_type\":...,\"data\":...} "
-                "because the server does not fetch remote URLs");
-            append_dropped_image_note(&msg->content, msg->images.error);
-        } else if (source_type && strcmp(source_type, "base64")) {
-            /* "base64" is the only source Anthropic clients send inline, but a
-             * missing type is common in hand-rolled payloads; the data itself
-             * is still validated by the push. */
-            server_image_inputs_error(&msg->images,
-                                      "unsupported image source type \"%s\"",
-                                      source_type);
-            append_dropped_image_note(&msg->content, msg->images.error);
-        } else if (server_image_inputs_push_base64(&msg->images, media_type,
-                                                   image_data, marker)) {
-            append_owned_text(&msg->content, marker);
-        } else {
-            append_dropped_image_note(&msg->content, msg->images.error);
-        }
+        if (!source_type || strcmp(source_type, "base64") ||
+            !server_image_inputs_push_base64(&msg->images, media_type,
+                                             image_data, marker))
+            goto bad;
+        append_owned_text(&msg->content, marker);
     } else {
         if (text) {
             buf b = {0};
@@ -2497,14 +2264,14 @@ bad:
     return false;
 }
 
-static bool parse_anthropic_content(const char **p, chat_msg *msg) {
+static bool parse_anthropic_content(const char **p, chat_msg *msg, bool allow_tools) {
     json_ws(p);
     if (**p == '"') return json_string(p, &msg->content);
     if (json_lit(p, "null")) {
         msg->content = xstrdup("");
         return true;
     }
-    if (**p != '[') return json_skip_value(p);
+    if (**p != '[') return allow_tools ? json_skip_value(p) : false;
     (*p)++;
     json_ws(p);
     while (**p && **p != ']') {
@@ -2518,7 +2285,7 @@ static bool parse_anthropic_content(const char **p, chat_msg *msg) {
             msg->content = buf_take(&b);
             free(s);
         } else if (**p == '{') {
-            if (!parse_anthropic_content_block(p, msg->role ? msg->role : "", msg)) return false;
+            if (!parse_anthropic_content_block(p, allow_tools, msg)) return false;
         } else if (!json_skip_value(p)) {
             return false;
         }
@@ -2560,7 +2327,7 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
             } else if (!strcmp(key, "content")) {
                 free(msg.content);
                 msg.content = NULL;
-                if (!parse_anthropic_content(p, &msg)) {
+                if (!parse_anthropic_content(p, &msg, true)) {
                     free(key);
                     goto fail;
                 }
@@ -2577,13 +2344,7 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
         (*p)++;
         if (!msg.role) msg.role = xstrdup("user");
         if (!msg.content) msg.content = xstrdup("");
-        if (msg.images.len && strcmp(msg.role, "user")) {
-            server_image_inputs_error(&msg.images,
-                                      "images are only accepted on \"user\" "
-                                      "messages, not \"%s\"", msg.role);
-            server_image_inputs_drop(&msg.images, &msg.content);
-            append_dropped_image_note(&msg.content, msg.images.error);
-        }
+        if (msg.images.len && strcmp(msg.role, "user")) goto fail;
         chat_msgs_push(msgs, msg);
         memset(&msg, 0, sizeof(msg));
         json_ws(p);
@@ -2591,17 +2352,11 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
         json_ws(p);
         continue;
 fail:
-        /* The message that owns the diagnostic is about to be freed, so lift
-         * it to the conversation for the request-level error. */
-        if (msg.images.error[0] && !msgs->image_error[0])
-            snprintf(msgs->image_error, sizeof(msgs->image_error), "%s",
-                     msg.images.error);
         chat_msg_free(&msg);
         return false;
     }
     if (**p != ']') return false;
     (*p)++;
-    if (chat_msgs_newest_image_rejected(msgs)) return false;
     return true;
 }
 
@@ -3154,21 +2909,6 @@ static bool chat_history_uses_tool_context(const chat_msgs *msgs,
     return false;
 }
 
-/* Clients that must echo reasoning_content back (DeepSeek thinking mode
- * rejects an empty string) pad an empty thinking channel with a single space
- * on replay.  The model itself always samples the closing tag immediately
- * after the opening one, so a whitespace-only channel re-renders to nothing:
- * <think> + " " + </think> re-tokenizes to an extra
- * space token that the live KV does not have, and that one token
- * invalidates the whole prefix.  Render it as the clean <think></think>
- * boundary the KV was sampled from. */
-static const char *thinking_reasoning_visible(const char *reasoning) {
-    if (!reasoning) return "";
-    const char *p = reasoning;
-    while (*p && isspace((unsigned char)*p)) p++;
-    return *p ? reasoning : "";
-}
-
 static char *render_deepseek_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                               const tool_schema_orders *tool_orders,
                                               ds4_think_mode think_mode) {
@@ -3223,7 +2963,7 @@ static char *render_deepseek_chat_prompt_text(const chat_msgs *msgs, const char 
                 if (think) {
                     if (tool_context || i > last_user_idx) {
                         buf_puts(&out, "<think>");
-                        buf_puts(&out, thinking_reasoning_visible(m->reasoning));
+                        buf_puts(&out, m->reasoning ? m->reasoning : "");
                         buf_puts(&out, "</think>");
                     } else {
                         buf_puts(&out, "</think>");
@@ -3371,141 +3111,6 @@ static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
                                               tool_orders, think_mode);
 }
 
-/* prompt_text contains random per-request image sentinels while the real
- * prompt contains only the vision token spans.  Keep a separate stable text
- * representation for live-continuation matching: it records the encoder
- * fingerprint and token span at each sentinel, but is never tokenized or sent
- * to the model. */
-static bool request_build_visible_prompt_text(request *r,
-                                              server_image_input *const *inputs,
-                                              size_t count) {
-    if (!r || !r->prompt_text) return false;
-    free(r->visible_prompt_text);
-    r->visible_prompt_text = NULL;
-    if (count == 0) {
-        r->visible_prompt_text = xstrdup(r->prompt_text);
-        return true;
-    }
-    if (!inputs || r->image_count != count) return false;
-
-    static const char hex[] = "0123456789abcdef";
-    buf visible = {0};
-    const char *cursor = r->prompt_text;
-    for (size_t i = 0; i < count; i++) {
-        const char *marker = inputs[i] ? inputs[i]->marker : NULL;
-        const char *at = marker ? strstr(cursor, marker) : NULL;
-        if (!at) {
-            buf_free(&visible);
-            return false;
-        }
-        buf_append(&visible, cursor, (size_t)(at - cursor));
-        buf_puts(&visible, "\036DS4_VISION_");
-        for (size_t j = 0; j < sizeof(r->images[i].embedding.fingerprint); j++) {
-            const uint8_t byte = r->images[i].embedding.fingerprint[j];
-            buf_putc(&visible, hex[byte >> 4]);
-            buf_putc(&visible, hex[byte & 15]);
-        }
-        char span[64];
-        snprintf(span, sizeof(span), "_%u_%u\037",
-                 r->images[i].token_start,
-                 r->images[i].embedding.token_count);
-        buf_puts(&visible, span);
-        cursor = at + strlen(marker);
-    }
-    buf_puts(&visible, cursor);
-    r->visible_prompt_text = buf_take(&visible);
-    return r->visible_prompt_text != NULL;
-}
-
-static const char *request_visible_prompt_text(const request *r) {
-    return r && r->visible_prompt_text ? r->visible_prompt_text :
-        (r && r->prompt_text ? r->prompt_text : NULL);
-}
-
-static int ds4_vision_encode_cached(server *s, ds4_engine *e,
-                                    const uint8_t *encoded, size_t encoded_len,
-                                    ds4_vision_embedding *out,
-                                    char *error, size_t error_cap);
-static uint64_t ds4_vembed_hits_now(server *s);
-static uint64_t ds4_vembed_bytes_now(server *s);
-static void ds4_vembed_log_reuse(uint64_t hits, size_t count,
-                                 uint64_t cache_bytes);
-
-/* Only call on a marker already matched against a server-generated nonce.
- * Keep its width/offset but give the rendered replay key stable bytes. Literal
- * marker-shaped user text must stay byte-exact, not become a wildcard. */
-static void canonicalize_image_marker(char *marker) {
-    memset(marker + sizeof("\x1e" "DS4_IMAGE_") - 1, '0', 24);
-}
-static void server_log(ds4_log_type type, const char *fmt, ...);
-
-/* Vision image budget.  Dropping older images is an intentionally lossy
- * policy, so it is opt-in: by default requests with more than
- * DS4_VISION_REJECT_LIMIT images are rejected.  Setting the environment
- * variable DS4_VISION_KEEP_IMAGES=N (0 < N <= DS4_VISION_HARD_LIMIT) enables
- * auto-reduction instead: the OLDEST images are dropped (the freshest views
- * matter most to agent loops) and each dropped image sentinel in the rendered
- * transcript is replaced by a fixed text note, so the model still sees an
- * honest history and the prompt remains a deterministic cache key.  The
- * retained set is always the last N in document order; a hard limit still
- * fails absurd requests fast, before any work. */
-#define DS4_VISION_REJECT_LIMIT 16
-#define DS4_VISION_HARD_LIMIT 1024
-#define DS4_VISION_OMIT_NOTE "[oldest image omitted to fit the vision budget]"
-
-static size_t ds4_vision_keep_cached;   /* 0 = auto-reduce disabled */
-static pthread_once_t ds4_vision_keep_once = PTHREAD_ONCE_INIT;
-
-static void ds4_vision_keep_images_init(void) {
-    const char *env = getenv("DS4_VISION_KEEP_IMAGES");
-    if (!env || !env[0]) return;
-    char *end = NULL;
-    long v = strtol(env, &end, 10);
-    if (*end == '\0' && v >= 1 && v <= DS4_VISION_HARD_LIMIT) {
-        ds4_vision_keep_cached = (size_t)v;
-    } else {
-        server_log(DS4_LOG_WARNING,
-                   "ds4-server: ignoring invalid DS4_VISION_KEEP_IMAGES='%s' "
-                   "(valid range 1..%d); auto-reduce stays disabled",
-                   env, DS4_VISION_HARD_LIMIT);
-    }
-}
-
-/* Effective auto-reduce target, 0 when disabled. */
-static size_t ds4_vision_keep_images(void) {
-    pthread_once(&ds4_vision_keep_once, ds4_vision_keep_images_init);
-    return ds4_vision_keep_cached;
-}
-
-/* Rewrite r->prompt_text dropping the first `dropped` image sentinels.
- * Returns false if a sentinel went missing during rendering. */
-static bool ds4_prompt_text_drop_oldest_images(request *r,
-                                                server_image_input **inputs,
-                                                size_t count, size_t dropped) {
-    const char *note = DS4_VISION_OMIT_NOTE;
-    const size_t note_len = strlen(note);
-    buf out = {0};
-    const char *cursor = r->prompt_text;
-    bool ok = true;
-    for (size_t i = 0; i < count; i++) {
-        const char *marker = strstr(cursor, inputs[i]->marker);
-        if (!marker) { ok = false; break; }
-        buf_append(&out, cursor, (size_t)(marker - cursor));
-        if (i < dropped) buf_append(&out, note, note_len);
-        else buf_append(&out, marker, strlen(inputs[i]->marker));
-        cursor = marker + strlen(inputs[i]->marker);
-    }
-    if (ok) {
-        buf_append(&out, cursor, strlen(cursor));
-        char *text = buf_take(&out);
-        free(r->prompt_text);
-        r->prompt_text = text;
-    } else {
-        buf_free(&out);
-    }
-    return ok;
-}
-
 static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
                                                request *r,
                                                const chat_msgs *msgs,
@@ -3514,21 +3119,10 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
     for (int i = 0; msgs && i < msgs->len; i++) count += msgs->v[i].images.len;
     if (count == 0) {
         ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
-        return request_build_visible_prompt_text(r, NULL, 0);
+        return true;
     }
-    const size_t keep = ds4_vision_keep_images();   /* 0 = reject, not reduce */
-    if (keep == 0) {
-        if (count > DS4_VISION_REJECT_LIMIT) {
-            snprintf(err, errlen,
-                     "too many images; at most %d are allowed "
-                     "(set DS4_VISION_KEEP_IMAGES=N to serve the request "
-                     "with the oldest images dropped instead)",
-                     DS4_VISION_REJECT_LIMIT);
-            return false;
-        }
-    } else if (count > DS4_VISION_HARD_LIMIT) {
-        snprintf(err, errlen, "too many images; at most %d are allowed",
-                 DS4_VISION_HARD_LIMIT);
+    if (count > 16) {
+        snprintf(err, errlen, "too many images; at most 16 are allowed");
         return false;
     }
     if (!e || !s || !ds4_engine_has_vision(e)) {
@@ -3545,47 +3139,23 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
             inputs[next++] = &msgs->v[i].images.v[j];
     }
 
-    server_image_input **inputs_base = inputs;
-    ds4_vision_embedding *embeddings_base = embeddings;
-    size_t total_images = count;
-    if (keep != 0 && count > keep) {
-        size_t dropped = count - keep;
-        if (!ds4_prompt_text_drop_oldest_images(r, inputs, count, dropped)) {
-            free(inputs_base);
-            free(embeddings_base);
-            snprintf(err, errlen, "image marker was lost while rendering the request");
-            return false;
-        }
-        inputs += dropped;
-        embeddings += dropped;
-        count -= dropped;
-        server_log(DS4_LOG_WARNING,
-                   "ds4-server: multimodal image budget: %zu images, kept last %zu, omitted %zu oldest",
-                   total_images, count, dropped);
-    }
-
     bool ok = true;
     server_inference_lock(s);
-    const uint64_t hits_before = ds4_vembed_hits_now(s);
     for (size_t i = 0; i < count; i++) {
-        if (!ds4_vision_encode_cached(s, e, inputs[i]->encoded,
-                                      inputs[i]->encoded_len,
-                                      &embeddings[i], err, errlen)) {
+        if (!server_encode_image(s, inputs[i], &embeddings[i], err, errlen)) {
             ok = false;
             break;
         }
     }
-    const uint64_t vembed_hits = ds4_vembed_hits_now(s) - hits_before;
-    const uint64_t vembed_bytes = ds4_vembed_bytes_now(s);
     server_inference_unlock(s);
-    if (ok) ds4_vembed_log_reuse(vembed_hits, count, vembed_bytes);
     if (!ok) goto done;
 
     r->images = xmalloc(count * sizeof(r->images[0]));
+    r->image_markers = xmalloc(count * sizeof(r->image_markers[0]));
     memset(r->images, 0, count * sizeof(r->images[0]));
     const char *cursor = r->prompt_text;
     for (size_t i = 0; i < count; i++) {
-        char *marker = strstr(cursor, inputs[i]->marker);
+        const char *marker = strstr(cursor, inputs[i]->marker);
         if (!marker) {
             snprintf(err, errlen, "image marker was lost while rendering the request");
             ok = false;
@@ -3600,22 +3170,23 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
             break;
         }
         r->image_count++;
+        memcpy(r->image_markers[i], inputs[i]->marker, sizeof(r->image_markers[i]));
         cursor = marker + strlen(inputs[i]->marker);
-        canonicalize_image_marker(marker);
     }
     if (ok) ds4_tokenize_rendered_chat(e, cursor, &r->prompt);
-    if (ok) ok = request_build_visible_prompt_text(r, inputs, count);
 
 done:
     for (size_t i = 0; i < count; i++)
         ds4_vision_embedding_free(&embeddings[i]);
-    free(inputs_base);
-    free(embeddings_base);
+    free(embeddings);
+    free(inputs);
     if (!ok) {
         ds4_tokens_free(&r->prompt);
         for (size_t i = 0; i < r->image_count; i++)
             ds4_vision_embedding_free(&r->images[i].embedding);
         free(r->images);
+        free(r->image_markers);
+        r->image_markers = NULL;
         r->images = NULL;
         r->image_count = 0;
     }
@@ -3667,7 +3238,7 @@ static char *render_deepseek_live_tool_tail(const chat_msgs *msgs, int start,
                 buf_puts(&out, "<｜Assistant｜>");
                 if (think) {
                     buf_puts(&out, "<think>");
-                    buf_puts(&out, thinking_reasoning_visible(m->reasoning));
+                    buf_puts(&out, m->reasoning ? m->reasoning : "");
                     buf_puts(&out, "</think>");
                 } else {
                     buf_puts(&out, "</think>");
@@ -4152,9 +3723,9 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     free(tool_schemas);
     return true;
 bad:
-    chat_msgs_request_error(&msgs, err, errlen);
     chat_msgs_free(&msgs);
     free(tool_schemas);
+    snprintf(err, errlen, "invalid JSON request");
     request_free(r);
     return false;
 }
@@ -4375,10 +3946,10 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     free(tool_schemas);
     return true;
 bad:
-    chat_msgs_request_error(&msgs, err, errlen);
     chat_msgs_free(&msgs);
     free(system);
     free(tool_schemas);
+    snprintf(err, errlen, "invalid JSON request");
     request_free(r);
     return false;
 }
@@ -4493,21 +4064,17 @@ static bool parse_responses_content_array(const char **p, char **out,
                 !strcmp(type, "text") ||
                 !strcmp(type, "summary_text") ||
                 !strcmp(type, "reasoning_text"));
-            bool is_image_block = image_url && (!type ||
-                                                !strcmp(type, "input_image") ||
-                                                !strcmp(type, "image_url") ||
-                                                !strcmp(type, "image"));
+            bool is_image_block = type && !strcmp(type, "input_image");
             if (is_image_block) {
                 char marker[SERVER_IMAGE_MARKER_BYTES];
-                if (images &&
-                    server_image_inputs_push_data_uri(images, image_url, marker)) {
-                    buf_puts(&b, marker);
-                } else {
-                    char note[SERVER_IMAGE_NOTE_BYTES];
-                    format_dropped_image_note(note, images ? images->error :
-                                              "images are not accepted here");
-                    buf_puts(&b, note);
+                if (!images ||
+                    !server_image_inputs_push_data_uri(images, image_url, marker)) {
+                    free(type);
+                    free(text);
+                    free(image_url);
+                    goto fail;
                 }
+                buf_puts(&b, marker);
             } else if (!is_text_block || !text) {
                 free(type);
                 free(text);
@@ -4550,12 +4117,7 @@ static bool parse_responses_content_array_multimodal(
     char *tmp = NULL;
     server_image_inputs_free(images);
     if (!parse_responses_content_array(p, &tmp, images)) {
-        /* Freeing clears the diagnostic, so carry it across the reset for the
-         * caller to turn into a useful 400. */
-        char saved[SERVER_IMAGE_ERROR_BYTES];
-        snprintf(saved, sizeof(saved), "%s", images ? images->error : "");
         server_image_inputs_free(images);
-        if (images) snprintf(images->error, sizeof(images->error), "%s", saved);
         return false;
     }
     free(*dst);
@@ -4608,7 +4170,7 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
         char *result = NULL;
         char *tools_json = NULL;
         char *status_str = NULL;
-        server_image_inputs content_images = {0};
+        server_image_inputs content_images = {0}, output_images = {0};
         json_ws(p);
         while (**p && **p != '}') {
             char *key = NULL;
@@ -4632,9 +4194,6 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
             } else if (!strcmp(key, "content")) {
                 if (!parse_responses_content_array_multimodal(
                         p, &content, &content_images)) {
-                    if (content_images.error[0])
-                        snprintf(msgs->image_error, sizeof(msgs->image_error),
-                                 "%s", content_images.error);
                     free(key);
                     goto item_fail;
                 }
@@ -4670,9 +4229,10 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                     goto item_fail;
                 }
             } else if (!strcmp(key, "output")) {
+                server_image_inputs_free(&output_images);
                 json_ws(p);
                 if (**p == '[') {
-                    if (!parse_responses_content_array_replace(p, &output)) {
+                    if (!parse_responses_content_array_multimodal(p, &output, &output_images)) {
                         free(key);
                         goto item_fail;
                     }
@@ -4757,6 +4317,7 @@ item_fail:
             free(tools_json);
             free(status_str);
             server_image_inputs_free(&content_images);
+            server_image_inputs_free(&output_images);
             buf_free(&pending_reasoning);
             return false;
         }
@@ -4777,6 +4338,7 @@ item_fail:
             free(tools_json);
             free(status_str);
             server_image_inputs_free(&content_images);
+            server_image_inputs_free(&output_images);
             goto fail;
         }
         (*p)++;
@@ -4805,16 +4367,33 @@ item_fail:
             free(tools_json);
             free(status_str);
             server_image_inputs_free(&content_images);
+            server_image_inputs_free(&output_images);
             buf_free(&pending_reasoning);
             return false;
         }
-        if (content_images.len &&
-            (strcmp(t, "message") || (role && strcmp(role, "user")))) {
-            server_image_inputs_error(&content_images,
-                                      "images are only accepted on \"user\" "
-                                      "messages");
-            server_image_inputs_drop(&content_images, &content);
-            append_dropped_image_note(&content, content_images.error);
+        if ((content_images.len &&
+             (strcmp(t, "message") || (role && strcmp(role, "user")))) ||
+            (output_images.len && strcmp(t, "function_call_output") &&
+             strcmp(t, "custom_tool_call_output"))) {
+            free(type);
+            free(role);
+            free(content);
+            free(name);
+            free(namespace);
+            free(call_id);
+            free(item_id);
+            free(arguments);
+            free(output);
+            free(input_str);
+            free(summary);
+            free(action);
+            free(result);
+            free(tools_json);
+            free(status_str);
+            server_image_inputs_free(&content_images);
+            server_image_inputs_free(&output_images);
+            buf_free(&pending_reasoning);
+            return false;
         }
         /* Three classes of items:
          *   1. consumes_reasoning: assistant message / function_call / hosted-tool
@@ -4894,6 +4473,8 @@ item_fail:
             msg.role = xstrdup("tool");
             msg.content = output ? output : xstrdup("");
             output = NULL;
+            msg.images = output_images;
+            memset(&output_images, 0, sizeof(output_images));
             if (call_id || item_id) {
                 chat_msg_add_tool_call_id(&msg, call_id ? call_id : item_id);
             }
@@ -4973,6 +4554,7 @@ item_fail:
                     free(tools_json);
                     free(status_str);
                     server_image_inputs_free(&content_images);
+                    server_image_inputs_free(&output_images);
                     buf_free(&pending_reasoning);
                     return false;
                 }
@@ -5014,6 +4596,7 @@ item_fail:
             free(tools_json);
             free(status_str);
             server_image_inputs_free(&content_images);
+            server_image_inputs_free(&output_images);
             buf_free(&pending_reasoning);
             return false;
         }
@@ -5034,6 +4617,7 @@ item_fail:
         free(tools_json);
         free(status_str);
         server_image_inputs_free(&content_images);
+        server_image_inputs_free(&output_images);
         json_ws(p);
         if (**p == ',') (*p)++;
         json_ws(p);
@@ -5044,12 +4628,6 @@ item_fail:
      * empty assistant message so the next turn still renders a <think>...</think>
      * block. Dropping it loses model state when a previous response ended with
      * a reasoning-only incomplete turn and the client replays the history. */
-    /* Checked before the trailing reasoning item is flushed, so an item that
-     * carries no content of its own cannot hide a rejected image behind it. */
-    if (chat_msgs_newest_image_rejected(msgs)) {
-        buf_free(&pending_reasoning);
-        return false;
-    }
     if (pending_reasoning.len) {
         chat_msg msg = {0};
         msg.role = xstrdup("assistant");
@@ -5402,11 +4980,11 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     free(tool_schemas);
     return true;
 bad:
-    chat_msgs_request_error(&msgs, err, errlen);
     chat_msgs_free(&msgs);
     buf_free(&loaded_tool_schemas);
     free(instructions);
     free(tool_schemas);
+    snprintf(err, errlen, "invalid JSON request");
     request_free(r);
     return false;
 }
@@ -9532,6 +9110,46 @@ typedef struct {
     uint64_t scan_clock;
 } tool_memory;
 
+/* Image markers have request-local nonces. Normalize only actual marker spans
+ * for visible-history matching, and retain their byte offsets so literal text
+ * cannot impersonate an image. Full fingerprints are checked against live KV
+ * before any prefix is reused. Normalization preserves all byte offsets. */
+typedef struct {
+    size_t count;
+    size_t offsets[16];
+} visible_image_key;
+
+static char *visible_prompt_key(const request *req, const char *text,
+                                 visible_image_key *images) {
+    memset(images, 0, sizeof(*images));
+    if (!req || !text || req->image_count > 16 ||
+        (req->image_count && !req->image_markers)) return NULL;
+    char *key = xstrdup(text);
+    const char *cursor = text;
+    for (size_t i = 0; i < req->image_count; i++) {
+        const char *marker = strstr(cursor, req->image_markers[i]);
+        size_t len = strlen(req->image_markers[i]);
+        if (!marker || !len) {
+            free(key);
+            return NULL;
+        }
+        images->offsets[images->count++] = (size_t)(marker - text);
+        memset(key + (marker - text), '\036', len);
+        cursor = marker + len;
+    }
+    return key;
+}
+
+static bool visible_image_prefix_matches(const visible_image_key *incoming,
+                                           const visible_image_key *old,
+                                           size_t boundary) {
+    if (incoming->count < old->count) return false;
+    for (size_t i = 0; i < old->count; i++)
+        if (incoming->offsets[i] != old->offsets[i]) return false;
+    return incoming->count == old->count ||
+           incoming->offsets[old->count] >= boundary;
+}
+
 typedef struct {
     bool valid;
     /* Token frontier of a live assistant tool-call turn. Continuing from this
@@ -9543,6 +9161,7 @@ typedef struct {
      * Anthropic currently uses only the call-id side of the state. */
     char *visible_text;
     size_t visible_len;
+    visible_image_key images;
     /* Tool-call ids generated at the same live frontier. A following tool
      * result for these ids is a direct protocol continuation and should not
      * trigger prompt-prefix matching or checkpoint canonicalization. */
@@ -9558,10 +9177,7 @@ typedef struct {
     int live_tokens;
     char *visible_text;
     size_t visible_len;
-    /* Byte position in request::prompt_text that corresponds to visible_len.
-     * These differ only for the stable fingerprint sentinels used to compare
-     * repeated image data URLs. */
-    size_t raw_visible_len;
+    visible_image_key images;
 } visible_live_state;
 
 struct server_slot {
@@ -9586,36 +9202,103 @@ struct server_slot {
     char decode_err[160];
 };
 
-static bool id_list_contains(const stop_list *ids, const char *id);
-static void id_list_push_unique(stop_list *ids, const char *id);
-
-/* Vision embedding cache.  Every multimodal request re-encodes ALL images in
- * its history through the vision encoder, on every turn, even when the live KV
- * prefix hits and the bytes are unchanged.  Encoder output is deterministic
- * for identical encoded bytes on the same engine, so cache the embedding
- * (immutable after insert) keyed by a 128-bit hash of those bytes and copy it
- * out on hit.  All access happens under inference_mu (the encode loop already
- * holds it), so entries need no individual locking.  The byte budget is a
- * ceiling, not a reservation: memory only materializes for embeddings that
- * were actually produced, and LRU eviction caps growth; a session that never
- * encodes images costs nothing.  A vision embedding is a few MiB, so the
- * slot table caps ordinary embeddings at roughly 205 MiB.  The byte budget is
- * a hard cap over embeddings plus their exact encoded-byte keys, so unusually
- * large inputs may make the byte budget bind first.  Both constants can be
- * lowered at compile time for small hosts. */
-#define DS4_VEMBED_CACHE_SLOTS 64
-#define DS4_VEMBED_CACHE_BYTES (256ull << 20)
-#define DS4_VEMBED_HIDDEN 4096u
+#define SERVER_IMAGE_CACHE_ENTRIES 32
+#define SERVER_IMAGE_CACHE_BYTES (128u * 1024u * 1024u)
 
 typedef struct {
-    uint64_t h1, h2;
-    uint8_t *encoded;            /* exact cache key, owned */
+    uint8_t *encoded;
     size_t encoded_len;
-    ds4_vision_embedding emb;   /* owned deep copy */
-    uint64_t bytes;
-    uint64_t use_seq;
-    bool used;
-} ds4_vembed_entry;
+    ds4_vision_embedding embedding;
+    size_t data_bytes;
+    uint64_t used;
+} server_image_cache_entry;
+
+typedef struct {
+    server_image_cache_entry entries[SERVER_IMAGE_CACHE_ENTRIES];
+    size_t bytes;
+    uint64_t clock;
+} server_image_cache;
+
+static void server_image_cache_remove(server_image_cache *cache,
+                                      server_image_cache_entry *entry) {
+    cache->bytes -= entry->encoded_len + entry->data_bytes;
+    free(entry->encoded);
+    ds4_vision_embedding_free(&entry->embedding);
+    memset(entry, 0, sizeof(*entry));
+}
+
+static void server_image_cache_clear(server_image_cache *cache) {
+    for (size_t i = 0; i < SERVER_IMAGE_CACHE_ENTRIES; i++)
+        server_image_cache_remove(cache, &cache->entries[i]);
+    cache->clock = 0;
+}
+
+static bool server_image_cache_get(server_image_cache *cache,
+                                   const server_image_input *input,
+                                   ds4_vision_embedding *out) {
+    for (size_t i = 0; i < SERVER_IMAGE_CACHE_ENTRIES; i++) {
+        server_image_cache_entry *entry = &cache->entries[i];
+        if (!entry->encoded || entry->encoded_len != input->encoded_len ||
+            memcmp(entry->encoded, input->encoded, input->encoded_len)) continue;
+        float *data = malloc(entry->data_bytes);
+        if (!data) return false;
+        memcpy(data, entry->embedding.data, entry->data_bytes);
+        *out = entry->embedding;
+        out->data = data;
+        entry->used = ++cache->clock;
+        return true;
+    }
+    return false;
+}
+
+/* Cache only successful encodes. Exact byte keys avoid trusting a client hash;
+ * callers own a copy, since DeepSeek expands the natural embedding in place. */
+static void server_image_cache_put(server_image_cache *cache,
+                                   const server_image_input *input,
+                                   const ds4_vision_embedding *embedding,
+                                   uint32_t dim, size_t budget) {
+    if (!embedding->data || !dim || !embedding->token_count ||
+        !input->encoded_len ||
+        embedding->token_count > budget / sizeof(float) / dim) return;
+    size_t bytes = (size_t)embedding->token_count * dim * sizeof(float);
+    if (input->encoded_len > budget - bytes) return;
+    size_t total = input->encoded_len + bytes;
+    server_image_cache_entry *dest;
+    for (;;) {
+        dest = &cache->entries[0];
+        for (size_t i = 1; i < SERVER_IMAGE_CACHE_ENTRIES; i++) {
+            if (cache->entries[i].used < dest->used) dest = &cache->entries[i];
+        }
+        if (!dest->encoded && cache->bytes <= budget - total) break;
+        if (!dest->encoded) {
+            for (size_t i = 0; i < SERVER_IMAGE_CACHE_ENTRIES; i++) {
+                server_image_cache_entry *entry = &cache->entries[i];
+                if (entry->encoded && (!dest->encoded || entry->used < dest->used))
+                    dest = entry;
+            }
+        }
+        server_image_cache_remove(cache, dest);
+    }
+    uint8_t *encoded = malloc(input->encoded_len);
+    float *data = malloc((size_t)bytes);
+    if (!encoded || !data) {
+        free(encoded);
+        free(data);
+        return;
+    }
+    memcpy(encoded, input->encoded, input->encoded_len);
+    memcpy(data, embedding->data, (size_t)bytes);
+    *dest = (server_image_cache_entry) {
+        .encoded = encoded, .encoded_len = input->encoded_len,
+        .embedding = *embedding, .data_bytes = (size_t)bytes,
+        .used = ++cache->clock,
+    };
+    dest->embedding.data = data;
+    cache->bytes += total;
+}
+
+static bool id_list_contains(const stop_list *ids, const char *id);
+static void id_list_push_unique(stop_list *ids, const char *id);
 
 struct server {
     ds4_engine *engine;
@@ -9629,11 +9312,7 @@ struct server {
     int default_tokens;
     kv_disk_cache kv;
     tool_memory tool_mem;
-    ds4_vembed_entry vembed_cache[DS4_VEMBED_CACHE_SLOTS];
-    uint64_t vembed_seq;
-    uint64_t vembed_bytes;
-    uint64_t vembed_hits;
-    uint64_t vembed_misses;
+    server_image_cache image_cache; /* Protected by inference_mu. */
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
     pthread_mutex_t tool_mu;
@@ -9667,162 +9346,23 @@ static void server_inference_unlock(server *s) {
     pthread_mutex_unlock(&s->inference_mu);
 }
 
-/* 128-bit FNV-1a over the encoded image bytes.  This is only a fast candidate
- * filter: lookup also compares the complete encoded bytes, so a hash collision
- * is an ordinary cache miss rather than a false image hit. */
-static void ds4_vembed_hash(const uint8_t *p, size_t n,
-                            uint64_t *h1, uint64_t *h2) {
-    uint64_t a = 1469598103934665603ull, b = 0xcbf29ce484222325ull;
-    for (size_t i = 0; i < n; i++) {
-        a = (a ^ p[i]) * 1099511628211ull;
-        b = (b + p[i] + (uint64_t)i * 0x9E3779B97F4A7C15ull) *
-            1099511628211ull;
-    }
-    *h1 = a;
-    *h2 = b;
-}
-
-static uint64_t ds4_vembed_emb_bytes(const ds4_vision_embedding *emb) {
-    return (uint64_t)emb->token_count * DS4_VEMBED_HIDDEN * sizeof(float);
-}
-
-static bool ds4_vembed_copy_out(const ds4_vision_embedding *src,
-                                ds4_vision_embedding *dst) {
-    const uint64_t bytes = ds4_vembed_emb_bytes(src);
-    if (!src->data || src->token_count == 0 || bytes == 0) return false;
-    float *copy = malloc((size_t)bytes);
-    if (!copy) return false;
-    memcpy(copy, src->data, (size_t)bytes);
-    memset(dst, 0, sizeof(*dst));
-    dst->data = copy;
-    dst->token_count = src->token_count;
-    dst->layout = src->layout;
-    dst->grid_width = src->grid_width;
-    dst->grid_height = src->grid_height;
-    dst->width = src->width;
-    dst->height = src->height;
-    dst->content_width = src->content_width;
-    dst->content_height = src->content_height;
-    memcpy(dst->fingerprint, src->fingerprint, sizeof(dst->fingerprint));
-    return true;
-}
-
-static bool ds4_vembed_lookup(server *s, uint64_t h1, uint64_t h2,
-                              const uint8_t *encoded, size_t encoded_len,
-                              ds4_vision_embedding *out) {
-    for (int i = 0; i < DS4_VEMBED_CACHE_SLOTS; i++) {
-        ds4_vembed_entry *en = &s->vembed_cache[i];
-        if (!en->used || en->h1 != h1 || en->h2 != h2 ||
-            en->encoded_len != encoded_len ||
-            memcmp(en->encoded, encoded, encoded_len) != 0) continue;
-        if (!ds4_vembed_copy_out(&en->emb, out)) return false;
-        en->use_seq = ++s->vembed_seq;
-        s->vembed_hits++;
+/* The caller holds inference_mu across cache lookup and encoder execution. */
+static bool server_encode_image(server *s, const server_image_input *input,
+                                ds4_vision_embedding *out,
+                                char *err, size_t errlen) {
+    if (server_image_cache_get(&s->image_cache, input, out)) {
+        server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding cache hit");
         return true;
     }
-    s->vembed_misses++;
-    return false;
-}
-
-static void ds4_vembed_entry_clear(ds4_vembed_entry *en) {
-    if (!en) return;
-    free(en->encoded);
-    ds4_vision_embedding_free(&en->emb);
-    memset(en, 0, sizeof(*en));
-}
-
-static void ds4_vembed_store(server *s, uint64_t h1, uint64_t h2,
-                             const uint8_t *encoded, size_t encoded_len,
-                             const ds4_vision_embedding *emb) {
-    const uint64_t emb_bytes = ds4_vembed_emb_bytes(emb);
-    if (!encoded || encoded_len == 0 || !emb->data || emb->token_count == 0 ||
-        encoded_len > UINT64_MAX - emb_bytes)
-        return;
-    const uint64_t bytes = emb_bytes + encoded_len;
-    if (bytes > DS4_VEMBED_CACHE_BYTES) return;
-    ds4_vision_embedding copy = {0};
-    if (!ds4_vembed_copy_out(emb, &copy)) return;
-    uint8_t *encoded_copy = malloc(encoded_len);
-    if (!encoded_copy) {
-        ds4_vision_embedding_free(&copy);
-        return;
-    }
-    memcpy(encoded_copy, encoded, encoded_len);
-    while (s->vembed_bytes + bytes > DS4_VEMBED_CACHE_BYTES) {
-        int victim = -1;
-        uint64_t best = UINT64_MAX;
-        for (int i = 0; i < DS4_VEMBED_CACHE_SLOTS; i++) {
-            ds4_vembed_entry *en = &s->vembed_cache[i];
-            if (en->used && en->use_seq < best) { best = en->use_seq; victim = i; }
-        }
-        if (victim < 0) break;
-        ds4_vembed_entry *en = &s->vembed_cache[victim];
-        s->vembed_bytes -= en->bytes;
-        ds4_vembed_entry_clear(en);
-    }
-    int slot = -1;
-    for (int i = 0; i < DS4_VEMBED_CACHE_SLOTS; i++)
-        if (!s->vembed_cache[i].used) { slot = i; break; }
-    if (slot < 0) {
-        uint64_t best = UINT64_MAX;
-        for (int i = 0; i < DS4_VEMBED_CACHE_SLOTS; i++)
-            if (s->vembed_cache[i].use_seq < best) { best = s->vembed_cache[i].use_seq; slot = i; }
-        ds4_vembed_entry *en = &s->vembed_cache[slot];
-        s->vembed_bytes -= en->bytes;
-        ds4_vembed_entry_clear(en);
-    }
-    ds4_vembed_entry *en = &s->vembed_cache[slot];
-    memset(en, 0, sizeof(*en));
-    en->h1 = h1;
-    en->h2 = h2;
-    en->encoded = encoded_copy;
-    en->encoded_len = encoded_len;
-    en->emb = copy;
-    en->bytes = bytes;
-    en->use_seq = ++s->vembed_seq;
-    en->used = true;
-    s->vembed_bytes += bytes;
-}
-
-/* Counter snapshots; call only under inference_mu (all cache traffic, and
- * therefore these counters, mutates under that same lock). */
-static uint64_t ds4_vembed_hits_now(server *s) {
-    return s->vembed_hits;
-}
-
-static uint64_t ds4_vembed_bytes_now(server *s) {
-    return s->vembed_bytes;
-}
-
-/* Log the reuse ratio for one request.  All arguments are values captured
- * under inference_mu by the caller; the logger itself takes no lock and
- * reads no shared state, so the before/after counters cannot interleave
- * with a concurrent request's cache traffic. */
-static void ds4_vembed_log_reuse(uint64_t hits, size_t count,
-                                 uint64_t cache_bytes) {
-    if (hits == 0) return;
-    server_log(DS4_LOG_KVCACHE,
-               "ds4-server: vision encode reuse images=%zu encoder_runs=%llu cache_bytes=%llu MiB",
-               count,
-               (unsigned long long)(count - hits),
-               (unsigned long long)(cache_bytes >> 20));
-}
-
-/* ds4_engine_vision_encode_memory with a process-lifetime result cache.  The
- * caller owns the returned embedding exactly as with the engine call, so the
- * cache copy is always a fresh allocation.  Requires inference_mu. */
-static int ds4_vision_encode_cached(server *s, ds4_engine *e,
-                                    const uint8_t *encoded, size_t encoded_len,
-                                    ds4_vision_embedding *out,
-                                    char *error, size_t error_cap) {
-    uint64_t h1, h2;
-    ds4_vembed_hash(encoded, encoded_len, &h1, &h2);
-    if (ds4_vembed_lookup(s, h1, h2, encoded, encoded_len, out)) return 1;
-    if (!ds4_engine_vision_encode_memory(e, encoded, encoded_len, out,
-                                         error, error_cap))
-        return 0;
-    ds4_vembed_store(s, h1, h2, encoded, encoded_len, out);
-    return 1;
+    if (!ds4_engine_vision_encode_memory(s->engine, input->encoded,
+                                         input->encoded_len, out, err, errlen))
+        return false;
+    server_image_cache_put(&s->image_cache, input, out,
+                            4096, /* Both supported vision encoders emit 4096-wide rows. */
+                            SERVER_IMAGE_CACHE_BYTES);
+    server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding encoded; cache=%zu bytes",
+               s->image_cache.bytes);
+    return true;
 }
 
 /* Jobs are stack-owned by the client thread.  A resident-slot worker signals
@@ -9865,8 +9405,10 @@ static bool slot_job_cancelled(const server_slot *slot) {
     return slot && slot->running && job_cancelled(slot->running);
 }
 
-/* ================================================================== * Tool Call Text Memory.
- * ================================================================== *
+/* =========================================================================
+ * Tool Call Text Memory.
+ * =========================================================================
+ *
  * The model speaks DSML, while OpenAI and Anthropic clients round-trip tool
  * calls as JSON.  Re-rendering that JSON is not always the same byte sequence:
  * clients may preserve, sort, or rebuild object keys differently.  Tool call
@@ -10064,6 +9606,7 @@ static void live_tool_state_clear_locked(live_tool_state *st) {
     free(st->visible_text);
     st->visible_text = NULL;
     st->visible_len = 0;
+    memset(&st->images, 0, sizeof(st->images));
     st->valid = false;
     st->live_tokens = 0;
 }
@@ -10080,7 +9623,7 @@ static void visible_live_clear_locked(visible_live_state *st) {
     free(st->visible_text);
     st->visible_text = NULL;
     st->visible_len = 0;
-    st->raw_visible_len = 0;
+    memset(&st->images, 0, sizeof(st->images));
     st->live_tokens = 0;
     st->valid = false;
 }
@@ -10099,34 +9642,38 @@ static void thinking_live_clear(server *s, server_slot *slot) {
 }
 
 static void thinking_live_remember(server *s, server_slot *slot,
-                                   const char *visible_text,
-                                   size_t raw_visible_len) {
+                                   const char *visible_text, const request *req) {
     if (!s || !slot || !visible_text || !visible_text[0]) return;
+    visible_image_key images;
+    char *key = visible_prompt_key(req, visible_text, &images);
     pthread_mutex_lock(&s->tool_mu);
     visible_live_clear_locked(&slot->thinking_live);
-    slot->thinking_live.visible_text = xstrdup(visible_text);
-    slot->thinking_live.visible_len = strlen(visible_text);
-    slot->thinking_live.raw_visible_len = raw_visible_len;
+    slot->thinking_live.visible_text = key;
+    slot->thinking_live.visible_len = key ? strlen(key) : 0;
+    slot->thinking_live.images = images;
     slot->thinking_live.live_tokens = ds4_session_pos(slot->session);
-    slot->thinking_live.valid = true;
+    slot->thinking_live.valid = key != NULL;
     pthread_mutex_unlock(&s->tool_mu);
 }
 
 static void responses_live_remember(server *s, server_slot *slot,
                                     const char *visible_text,
-                                    const tool_calls *calls) {
+                                    const tool_calls *calls, const request *req) {
     if (!s || !slot || !visible_text || !visible_text[0]) return;
+    visible_image_key images;
+    char *key = visible_prompt_key(req, visible_text, &images);
     pthread_mutex_lock(&s->tool_mu);
     live_tool_state_clear_locked(&slot->responses_live);
-    slot->responses_live.visible_text = xstrdup(visible_text);
-    slot->responses_live.visible_len = strlen(visible_text);
+    slot->responses_live.visible_text = key;
+    slot->responses_live.visible_len = key ? strlen(key) : 0;
+    slot->responses_live.images = images;
     if (calls) {
         for (int i = 0; i < calls->len; i++) {
             id_list_push_unique(&slot->responses_live.call_ids, calls->v[i].id);
         }
     }
     slot->responses_live.live_tokens = ds4_session_pos(slot->session);
-    slot->responses_live.valid = true;
+    slot->responses_live.valid = key != NULL;
     pthread_mutex_unlock(&s->tool_mu);
 }
 
@@ -10363,8 +9910,10 @@ static void apply_anthropic_stream_tool_ids(tool_calls *calls,
     }
 }
 
-/* ================================================================== * KV Cache.
- * ================================================================== *
+/* =========================================================================
+ * KV Cache.
+ * =========================================================================
+ *
  * The server has one live Metal session.  We persist reusable DS4 session
  * snapshots when a cold prompt reaches a useful prefix, when a long continued
  * conversation has grown far enough, and when a request evicts the live session.
@@ -10391,13 +9940,11 @@ static void apply_anthropic_stream_tool_ids(tool_calls *calls,
  *   DS4 engine payload written by ds4_session_save_payload()
  *   optional tool-id map section
  *
- * The filename is SHA1(cache key bytes), not SHA1(token ids).  For ordinary
- * checkpoints the key is the rendered token prefix.  For live hidden state it
- * can instead be the client-visible transcript. Image-conditioned checkpoints
- * prepend exact image spans and hashes of the actual conditioning vectors to
- * the rendered tokens, so identical placeholder tokens produced by different
- * images or encoder weights cannot collide. The payload always contains the
- * exact token and graph state being restored.
+ * The filename is SHA1(cache text bytes), not SHA1(token ids).  For ordinary
+ * checkpoints the cache text is the rendered token prefix.  For live hidden
+ * state it can instead be the client-visible transcript: the payload still
+ * contains sampled reasoning KV, but the lookup key must be what the client can
+ * replay after a process restart or session switch.
  *
  * The optional tool-id map is not part of model state, but it is needed to
  * render future client JSON back to the exact DSML sampled by the model.  We
@@ -10409,7 +9956,6 @@ static void apply_anthropic_stream_tool_ids(tool_calls *calls,
 #define KV_EXT_TOOL_MAP DS4_KVSTORE_EXT_TOOL_MAP
 #define KV_EXT_RESPONSES_VISIBLE DS4_KVSTORE_EXT_RESPONSES_VISIBLE
 #define KV_EXT_THINKING_VISIBLE DS4_KVSTORE_EXT_THINKING_VISIBLE
-#define KV_EXT_VISION_IDENTITY DS4_KVSTORE_EXT_VISION_IDENTITY
 #define KV_TOOL_MAP_MAGIC0 'K'
 #define KV_TOOL_MAP_MAGIC1 'T'
 #define KV_TOOL_MAP_MAGIC2 'M'
@@ -10755,127 +10301,10 @@ static char *render_tokens_text(ds4_engine *engine, const ds4_tokens *tokens, si
     return ds4_kvstore_render_tokens_text(engine, tokens, out_len);
 }
 
-static void vision_cache_key_header(buf *key, size_t image_count) {
-    buf_puts(key, "\036DS4_VISION_KV_V2\n");
-    buf_printf(key, "%zu\n", image_count);
-}
-
-static void vision_cache_key_identity(buf *key, uint32_t token_start,
-                                      uint32_t token_count,
-                                      const uint8_t fingerprint[32]) {
-    static const char hex[] = "0123456789abcdef";
-    buf_printf(key, "%08x%08x", token_start, token_count);
-    for (size_t i = 0; i < 32; i++) {
-        char encoded[2] = {
-            hex[fingerprint[i] >> 4],
-            hex[fingerprint[i] & 15],
-        };
-        buf_append(key, encoded, sizeof(encoded));
-    }
-    buf_puts(key, "\n");
-}
-
-static bool vision_embedding_fingerprint_state(
-        ds4_engine *engine, ds4_vision_embedding *embedding) {
-    if (!embedding) return false;
-    embedding->state_fingerprint_valid = false;
-    const int embd = ds4_engine_embd_dim(engine);
-    if (!embedding->data || embedding->token_count == 0 || embd <= 0)
-        return false;
-    const uint64_t values =
-        (uint64_t)embedding->token_count * (uint64_t)embd;
-    if (values > SIZE_MAX / sizeof(embedding->data[0])) return false;
-    ds4_image_fingerprint_data(
-        embedding->data, (size_t)values * sizeof(embedding->data[0]),
-        embedding->state_fingerprint);
-    embedding->state_fingerprint_valid = true;
-    return true;
-}
-
-static char *vision_cache_key_from_text(const char *text, size_t text_len,
-                                        const ds4_vision_span *images,
-                                        size_t image_count) {
-    if (!text || !images || image_count == 0) return NULL;
-    buf key = {0};
-    vision_cache_key_header(&key, image_count);
-    for (size_t i = 0; i < image_count; i++) {
-        if (!images[i].embedding.state_fingerprint_valid) {
-            buf_free(&key);
-            return NULL;
-        }
-        vision_cache_key_identity(&key, images[i].token_start,
-                                  images[i].embedding.token_count,
-                                  images[i].embedding.state_fingerprint);
-    }
-    buf_puts(&key, "\037");
-    buf_append(&key, text, text_len);
-    return buf_take(&key);
-}
-
-/* Image placeholder tokens are identical for different images. Prefix the
- * rendered-token cache text with exact image spans and hashes of the vectors
- * that conditioned KV so only equivalent model input can select the payload. */
-static char *vision_cache_key_for_request(ds4_engine *engine,
-                                          const ds4_tokens *tokens,
-                                          ds4_vision_span *images,
-                                          size_t image_count) {
-    if (!engine || !tokens || !images || image_count == 0) return NULL;
-    for (size_t i = 0; i < image_count; i++) {
-        if (!images[i].embedding.state_fingerprint_valid &&
-            !vision_embedding_fingerprint_state(engine, &images[i].embedding))
-            return NULL;
-    }
-    size_t text_len = 0;
-    char *text = render_tokens_text(engine, tokens, &text_len);
-    char *key = vision_cache_key_from_text(text, text_len, images, image_count);
-    free(text);
-    return key;
-}
-
-static char *vision_cache_key_for_session(server *s, server_slot *slot,
-                                          const ds4_tokens *tokens) {
-    if (!s || !slot || !tokens) return NULL;
-    pthread_mutex_lock(&s->inference_mu);
-    const size_t image_count =
-        ds4_session_vision_identity_count(slot->session);
-    if (image_count == 0) {
-        pthread_mutex_unlock(&s->inference_mu);
-        return NULL;
-    }
-
-    size_t text_len = 0;
-    char *text = render_tokens_text(s->engine, tokens, &text_len);
-    buf key = {0};
-    vision_cache_key_header(&key, image_count);
-    bool valid = true;
-    for (size_t i = 0; i < image_count; i++) {
-        uint32_t token_start = 0, token_count = 0;
-        uint8_t fingerprint[32];
-        if (!ds4_session_vision_identity(slot->session, i, &token_start,
-                                         &token_count, fingerprint) ||
-            (uint64_t)token_start + token_count > (uint64_t)tokens->len) {
-            valid = false;
-            break;
-        }
-        vision_cache_key_identity(&key, token_start, token_count, fingerprint);
-    }
-    pthread_mutex_unlock(&s->inference_mu);
-    if (!valid) {
-        buf_free(&key);
-        free(text);
-        return NULL;
-    }
-    buf_puts(&key, "\037");
-    buf_append(&key, text, text_len);
-    free(text);
-    return buf_take(&key);
-}
-
 static bool byte_prefix_match(const char *text, size_t text_len,
                               const char *prefix, size_t prefix_len) {
     return ds4_kvstore_byte_prefix_match(text, text_len, prefix, prefix_len);
 }
-
 
 
 static void tokens_copy_prefix(ds4_tokens *dst, const ds4_tokens *src, int n) {
@@ -10967,12 +10396,12 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     pthread_mutex_lock(&s->inference_mu);
-    const bool vision_state = ds4_session_has_vision_state(slot->session);
-    const bool vision_key = (cache_text_ext & KV_EXT_VISION_IDENTITY) != 0;
-    /* Image-conditioned rows may only be written under a key containing their
-     * exact span and fingerprint identities.  Conversely, never label an
-     * ordinary text payload as vision-conditioned. */
-    if (vision_state != vision_key) {
+    /* The payload contains image-conditioned KV rows, but the disk key and
+     * trailer do not contain image fingerprints. Never let generic image
+     * placeholder tokens become a cache hit for a different image.
+     * sync_image_count covers progress-callback writes during prefill;
+     * checkpoint_image_count covers completed sessions. */
+    if (ds4_session_has_vision_state(slot->session)) {
         pthread_mutex_unlock(&s->inference_mu);
         return false;
     }
@@ -11001,18 +10430,6 @@ static void kv_cache_store_current(server *s, server_slot *slot,
     if (!s || !slot) return;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
     if (!tokens) return;
-
-    if (ds4_session_has_vision_state(slot->session)) {
-        char *vision_key = vision_cache_key_for_session(s, slot, tokens);
-        if (vision_key) {
-            kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len,
-                                            reason, vision_key,
-                                            KV_EXT_VISION_IDENTITY,
-                                            "vision-token-text");
-            free(vision_key);
-        }
-        return;
-    }
 
     char *visible_text = NULL;
     uint8_t visible_ext = 0;
@@ -11132,42 +10549,30 @@ static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
                                      int quant_bits, int ctx_size) {
     return ds4_kvstore_find_text_prefix(kc, prompt_text, 0, quant_bits, ctx_size);
 }
-
-static int kv_cache_find_text_prefix_filtered(
-        kv_disk_cache *kc, const char *prompt_text,
-        int quant_bits, int ctx_size,
-        uint8_t required_ext_flags, uint8_t forbidden_ext_flags) {
-    return ds4_kvstore_find_text_prefix_filtered(
-        kc, prompt_text, 0, quant_bits, ctx_size,
-        required_ext_flags, forbidden_ext_flags);
-}
 #endif
 
-static int kv_cache_try_load_text_filtered(
-                                  server *s, server_slot *slot,
+static int kv_cache_try_load_text(server *s, server_slot *slot,
                                   const char *prompt_text,
                                   ds4_tokens *effective_prompt,
                                   char **loaded_path_out,
                                   uint8_t *loaded_ext_flags_out,
-                                  bool responses_protocol,
-                                  uint8_t required_ext_flags,
-                                  uint8_t forbidden_ext_flags) {
+                                  bool responses_protocol) {
     if (!s || !slot) return 0;
     if (loaded_path_out) *loaded_path_out = NULL;
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
     ds4_kvstore_load_result lr = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     pthread_mutex_lock(&s->inference_mu);
-    /* A payload restore replaces the graph state. Clear identity from the
-     * slot's prior owner first; the vision caller reattaches the request's
-     * verified identities only after an image-keyed payload loads. */
+    /* Disk payloads intentionally carry no image identity. If this slot held
+     * vision state, discard it before restoring a text-only checkpoint so the
+     * next sync does not reject the fresh payload as a stale image match. */
     if (ds4_session_has_vision_state(slot->session)) {
         ds4_session_invalidate(slot->session);
     }
     pthread_mutex_lock(&s->kv_mu);
-    int loaded = ds4_kvstore_try_load_text_filtered(
-        &s->kv, s->engine, slot->session, prompt_text, effective_prompt, &lr,
-        &hooks, responses_protocol, required_ext_flags, forbidden_ext_flags);
+    int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, slot->session,
+                                           prompt_text, effective_prompt, &lr,
+                                           &hooks, responses_protocol);
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
     if (loaded > 0) {
@@ -11178,133 +10583,66 @@ static int kv_cache_try_load_text_filtered(
     return loaded;
 }
 
-static int kv_cache_try_load_text(server *s, server_slot *slot,
-                                  const char *prompt_text,
-                                  ds4_tokens *effective_prompt,
-                                  char **loaded_path_out,
-                                  uint8_t *loaded_ext_flags_out,
-                                  bool responses_protocol) {
-    return kv_cache_try_load_text_filtered(
-        s, slot, prompt_text, effective_prompt, loaded_path_out,
-        loaded_ext_flags_out, responses_protocol, 0,
-        KV_EXT_VISION_IDENTITY);
-}
-
-typedef int (*kv_cache_text_load_fn)(server *, server_slot *, const char *,
-                                     ds4_tokens *, char **, uint8_t *, bool);
-typedef char *(*kv_cache_tokens_render_fn)(ds4_engine *, const ds4_tokens *,
-                                           size_t *);
-
-static int kv_cache_try_load_tokenized_text_with(
-        server *s, server_slot *slot,
-        const char *prompt_text, const ds4_tokens *prompt_tokens,
-        ds4_tokens *effective_prompt, char **loaded_path_out,
-        uint8_t *loaded_ext_flags_out, bool responses_protocol,
-        kv_cache_text_load_fn load_text,
-        kv_cache_tokens_render_fn render_tokens) {
-    if (!s || !slot) return 0;
-    int loaded = load_text(s, slot, prompt_text,
-                           effective_prompt, loaded_path_out,
-                           loaded_ext_flags_out, responses_protocol);
-    /* Preserve the disabled-cache path: the ordinary loader is already a
-     * cheap no-op, and there is no reason to decode a context-sized token
-     * vector when no second lookup can succeed. */
-    if (loaded > 0 || !s->kv.enabled || !prompt_tokens) {
-        return loaded;
-    }
-
-    /* Checkpoints are keyed by decoded token text.  The canonical decoded
-     * bytes of the request tokens can differ from the originally rendered
-     * prompt (for example when the tokenizer canonicalizes a special-token
-     * spelling).  Keep the ordinary raw-text lookup fast, then retry a miss
-     * with the same representation used by the writer. */
-    size_t canonical_len = 0;
-    char *canonical = render_tokens(s->engine, prompt_tokens, &canonical_len);
-    const size_t prompt_len = prompt_text ? strlen(prompt_text) : 0;
-    if (canonical_len == prompt_len &&
-        (canonical_len == 0 || !memcmp(canonical, prompt_text, canonical_len)))
-    {
-        free(canonical);
-        return 0;
-    }
-
-    loaded = load_text(s, slot, canonical,
-                       effective_prompt, loaded_path_out,
-                       loaded_ext_flags_out, responses_protocol);
-    if (loaded > 0) {
-        server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: kv cache recovered canonical rendered prompt cached=%d",
-                   loaded);
-    }
-    free(canonical);
-    return loaded;
-}
-
-static int kv_cache_try_load_tokenized_text(server *s, server_slot *slot,
-                                            const char *prompt_text,
-                                            const ds4_tokens *prompt_tokens,
-                                            ds4_tokens *effective_prompt,
-                                            char **loaded_path_out,
-                                            uint8_t *loaded_ext_flags_out,
-                                            bool responses_protocol) {
-    return kv_cache_try_load_tokenized_text_with(
-        s, slot, prompt_text, prompt_tokens, effective_prompt,
-        loaded_path_out, loaded_ext_flags_out, responses_protocol,
-        kv_cache_try_load_text, render_tokens_text);
-}
-
 static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                              ds4_tokens *effective_prompt,
                              char **loaded_path_out,
                              uint8_t *loaded_ext_flags_out) {
-    return kv_cache_try_load_tokenized_text(
-        s, slot, req ? req->prompt_text : NULL,
-        req ? &req->prompt : NULL, effective_prompt,
-        loaded_path_out, loaded_ext_flags_out,
-        req && req->api == API_RESPONSES);
+    return kv_cache_try_load_text(s, slot, req ? req->prompt_text : NULL,
+                                  effective_prompt,
+                                  loaded_path_out,
+                                  loaded_ext_flags_out,
+                                  req && req->api == API_RESPONSES);
 }
 
-static int kv_cache_try_load_vision(server *s, server_slot *slot,
-                                    request *req,
-                                    ds4_tokens *effective_prompt,
-                                    char **loaded_path_out,
-                                    uint8_t *loaded_ext_flags_out) {
-    if (!s || !slot || !req || !s->kv.enabled ||
-        req->image_count == 0 || !req->images) return 0;
-    char *cache_key = vision_cache_key_for_request(
-        s->engine, &req->prompt, req->images, req->image_count);
-    if (!cache_key) return 0;
-
-    uint8_t ext_flags = 0;
-    int loaded = kv_cache_try_load_text_filtered(
-        s, slot, cache_key, effective_prompt, loaded_path_out, &ext_flags,
-        req->api == API_RESPONSES, KV_EXT_VISION_IDENTITY, 0);
-    free(cache_key);
-    if (loaded <= 0) return 0;
-
-    bool restored = false;
-    if (ext_flags & KV_EXT_VISION_IDENTITY) {
-        pthread_mutex_lock(&s->inference_mu);
-        restored = ds4_session_restore_vision_identities(
-            slot->session, req->images, req->image_count);
-        pthread_mutex_unlock(&s->inference_mu);
+/* A text-only suffix tokenizer would turn image markers into literal text.
+ * Keep the exact live tokens and splice each new image's already-built token
+ * block into the suffix. Historical image positions follow the live frontier,
+ * which may retain reasoning omitted from a client's visible replay. */
+static bool build_live_prompt_suffix(server *s, server_slot *slot,
+                                      const request *req, const char *suffix,
+                                      ds4_tokens *out) {
+    const ds4_tokens *live = ds4_session_tokens(slot->session);
+    if (!live || !suffix || req->image_count > 16) return false;
+    ds4_vision_span spans[16];
+    size_t old_count = req->image_count;
+    for (size_t i = 0; i < req->image_count; i++) {
+        if (!req->image_markers) return false;
+        spans[i] = req->images[i];
+        if (old_count == req->image_count &&
+            strstr(suffix, req->image_markers[i])) old_count = i;
     }
-    if (!restored) {
-        server_log(DS4_LOG_WARNING,
-                   "ds4-server: rejected vision disk checkpoint tokens=%d reason=invalid-image-identity-frontier",
-                   loaded);
-        pthread_mutex_lock(&s->inference_mu);
-        ds4_session_invalidate(slot->session);
-        pthread_mutex_unlock(&s->inference_mu);
-        ds4_tokens_free(effective_prompt);
-        if (loaded_path_out) {
-            free(*loaded_path_out);
-            *loaded_path_out = NULL;
+    if (!ds4_session_rebase_vision_state(slot->session, spans, old_count)) return false;
+    ds4_tokens prompt = {0};
+    ds4_tokens_copy(&prompt, live);
+    const char *cursor = suffix;
+    const int wrapper = ds4_engine_is_glm_dsa(s->engine) ? 1 : 0;
+    for (size_t i = old_count; i < req->image_count; i++) {
+        const char *marker = strstr(cursor, req->image_markers[i]);
+        int64_t start = (int64_t)req->images[i].token_start - wrapper;
+        uint64_t end = (uint64_t)req->images[i].token_start +
+                        req->images[i].embedding.token_count + wrapper;
+        if (!marker || start < 0 || end > (uint64_t)req->prompt.len) {
+            ds4_tokens_free(&prompt);
+            return false;
         }
-        return 0;
+        char *text = xstrndup(cursor, (size_t)(marker - cursor));
+        ds4_tokenize_rendered_chat(s->engine, text, &prompt);
+        free(text);
+        spans[i].token_start = (uint32_t)(prompt.len + wrapper);
+        for (int64_t p = start; p < (int64_t)end; p++)
+            ds4_tokens_push(&prompt, req->prompt.v[p]);
+        cursor = marker + strlen(req->image_markers[i]);
     }
-    if (loaded_ext_flags_out) *loaded_ext_flags_out = ext_flags;
-    return loaded;
+    ds4_tokenize_rendered_chat(s->engine, cursor, &prompt);
+    if (!ds4_session_vision_prefix_matches(slot->session, spans, req->image_count)) {
+        ds4_tokens_free(&prompt);
+        return false;
+    }
+    for (size_t i = 0; i < req->image_count; i++)
+        req->images[i].token_start = spans[i].token_start;
+    ds4_tokens_free(out);
+    *out = prompt;
+    return true;
 }
 
 static int live_text_prefix_prompt(server *s, server_slot *slot,
@@ -11328,11 +10666,10 @@ static int live_text_prefix_prompt(server *s, server_slot *slot,
      * keep its sampled tokenization and tokenize only the request bytes that
      * come after it.  Reusing req->prompt's token suffix would be wrong: full
      * prompt BPE may have merged across this byte boundary. */
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->prompt_text + live_text_len,
-        effective_prompt);
+    bool ok = build_live_prompt_suffix(s, slot, req, req->prompt_text + live_text_len,
+                                       effective_prompt);
     free(live_text);
-    return live_tokens->len;
+    return ok ? live_tokens->len : 0;
 }
 
 /* Tool-output-only Responses continuation.
@@ -11356,9 +10693,8 @@ static int responses_live_continuation_prompt(server *s, server_slot *slot,
     const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->responses_live_suffix_text,
-        effective_prompt);
+    if (!build_live_prompt_suffix(s, slot, req, req->responses_live_suffix_text,
+                                  effective_prompt)) return 0;
     if (matched_ids) *matched_ids = req->responses_live_call_ids.len;
     return live_tokens->len;
 }
@@ -11384,9 +10720,8 @@ static int anthropic_live_continuation_prompt(server *s, server_slot *slot,
     const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->anthropic_live_suffix_text,
-        effective_prompt);
+    if (!build_live_prompt_suffix(s, slot, req, req->anthropic_live_suffix_text,
+                                  effective_prompt)) return 0;
     if (matched_ids) *matched_ids = req->anthropic_live_call_ids.len;
     return live_tokens->len;
 }
@@ -11411,26 +10746,31 @@ static int responses_live_visible_prefix_prompt(server *s, server_slot *slot,
     if (!s || !slot || !req || !req->prompt_text || !effective_prompt) return 0;
     if (req->api != API_RESPONSES) return 0;
 
-    const size_t prompt_len = strlen(req->prompt_text);
+    visible_image_key images;
+    char *key = visible_prompt_key(req, req->prompt_text, &images);
+    if (!key) return 0;
+    const size_t prompt_len = strlen(key);
     size_t visible_len = 0;
     pthread_mutex_lock(&s->tool_mu);
     bool ok = slot->responses_live.valid &&
               slot->responses_live.live_tokens == live_pos &&
               slot->responses_live.visible_text &&
               slot->responses_live.visible_len < prompt_len &&
-              byte_prefix_match(req->prompt_text, prompt_len,
+              visible_image_prefix_matches(&images, &slot->responses_live.images,
+                                             slot->responses_live.visible_len) &&
+              byte_prefix_match(key, prompt_len,
                                 slot->responses_live.visible_text,
                                 slot->responses_live.visible_len);
     if (ok) visible_len = slot->responses_live.visible_len;
     pthread_mutex_unlock(&s->tool_mu);
+    free(key);
     if (!ok) return 0;
 
     const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->prompt_text + visible_len,
-        effective_prompt);
+    if (!build_live_prompt_suffix(s, slot, req, req->prompt_text + visible_len,
+                                  effective_prompt)) return 0;
     return live_tokens->len;
 }
 
@@ -11451,45 +10791,41 @@ static int thinking_live_visible_prefix_prompt(server *s, server_slot *slot,
                                                const request *req,
                                                int live_pos,
                                                ds4_tokens *effective_prompt) {
-    const char *visible_prompt = request_visible_prompt_text(req);
-    if (!s || !slot || !req || !req->prompt_text || !visible_prompt ||
-        !effective_prompt) return 0;
+    if (!s || !slot || !req || !req->prompt_text || !effective_prompt) return 0;
     if (req->kind != REQ_CHAT || req->api == API_RESPONSES) return 0;
 
-    const size_t prompt_len = strlen(visible_prompt);
-    const size_t raw_prompt_len = strlen(req->prompt_text);
-    size_t raw_visible_len = 0;
+    visible_image_key images;
+    char *key = visible_prompt_key(req, req->prompt_text, &images);
+    if (!key) return 0;
+    const size_t prompt_len = strlen(key);
+    size_t visible_len = 0;
     pthread_mutex_lock(&s->tool_mu);
     bool ok = slot->thinking_live.valid &&
               slot->thinking_live.live_tokens == live_pos &&
               slot->thinking_live.visible_text &&
               slot->thinking_live.visible_len < prompt_len &&
-              slot->thinking_live.raw_visible_len < raw_prompt_len &&
-              byte_prefix_match(visible_prompt, prompt_len,
+              visible_image_prefix_matches(&images, &slot->thinking_live.images,
+                                             slot->thinking_live.visible_len) &&
+              byte_prefix_match(key, prompt_len,
                                 slot->thinking_live.visible_text,
-                                slot->thinking_live.visible_len) &&
-              /* The remembered prefix can carry image sentinels (the live
-               * graph already holds their rows).  Anything AFTER the prefix
-               * is tokenized as plain text here, so a new image appearing
-               * beyond the remembered frontier must not take this path. */
-              memchr(req->prompt_text + slot->thinking_live.raw_visible_len,
-                     '\x1e',
-                     raw_prompt_len - slot->thinking_live.raw_visible_len) == NULL;
-    if (ok) raw_visible_len = slot->thinking_live.raw_visible_len;
+                                slot->thinking_live.visible_len);
+    if (ok) visible_len = slot->thinking_live.visible_len;
     pthread_mutex_unlock(&s->tool_mu);
+    free(key);
     if (!ok) return 0;
 
     const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->prompt_text + raw_visible_len,
-        effective_prompt);
+    if (!build_live_prompt_suffix(s, slot, req, req->prompt_text + visible_len,
+                                  effective_prompt)) return 0;
     return live_tokens->len;
 }
 
-/* ================================================================== * Trace Diagnostics.
- * ================================================================== *
+/* =========================================================================
+ * Trace Diagnostics.
+ * =========================================================================
+ *
  * The human transcript is not enough to debug prompt-cache misses.  The model
  * may generate text that is semantically accepted as a tool call, while the
  * next OpenAI request re-renders a slightly different canonical DSML block.
@@ -12177,7 +11513,7 @@ static int server_multimodal_resume_pos(ds4_session *session,
     const int common = ds4_session_common_prefix(session, prompt);
     return server_multimodal_resume_frontier(
         live, common, prompt->len,
-        ds4_session_vision_state_matches(session, images, image_count));
+        ds4_session_vision_prefix_matches(session, images, image_count));
 }
 
 static int server_session_sync_multimodal(server *s, server_slot *slot,
@@ -12310,18 +11646,12 @@ static int server_decode_budget(int requested, int generated, int room) {
 
 static bool should_remember_thinking_checkpoint(const request *r,
                                                 const thinking_state *thinking,
-                                                const char *finish,
-                                                const char *reasoning) {
-    if (!r || r->kind != REQ_CHAT) return false;
+                                                const char *finish) {
+    if (!r || r->kind != REQ_CHAT || r->has_tools) return false;
+    if (r->prompt_preserves_reasoning) return false;
     if (!ds4_think_mode_enabled(r->think_mode)) return false;
     if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
     if (thinking && thinking->inside) return false;
-    /* Tool-context and reasoning-preserving replays render assistant thinking
-     * back into history: use the preserved-reasoning bridge, which requires
-     * the sampled reasoning bytes.  Plain toolless replays drop reasoning: use
-     * the visible-only bridge. */
-    if (r->has_tools || r->prompt_preserves_reasoning)
-        return reasoning && reasoning[0];
     return true;
 }
 
@@ -12476,38 +11806,6 @@ static char *build_tool_checkpoint_suffix(const request *r, const char *content,
     return buf_take(&suffix);
 }
 
-/* Build the assistant turn as a Chat Completions client will render it on the
- * following request.  Pi returns reasoning_content to the caller, but the
- * DeepSeek renderer deliberately omits that reasoning for ordinary final
- * answers without tool context.  Tool schemas, an earlier tool turn, or an
- * emitted tool call make the renderer preserve it instead. */
-static bool chat_replay_preserves_reasoning(const request *r,
-                                            const tool_calls *calls) {
-    return r && (r->has_tools || r->prompt_preserves_reasoning ||
-                 (calls && calls->len > 0));
-}
-
-static char *build_chat_replay_assistant_suffix(const request *r,
-                                                const char *content,
-                                                const char *reasoning,
-                                                const tool_calls *calls) {
-    const server_model_syntax syntax =
-        r ? r->model_syntax : SERVER_MODEL_SYNTAX_DEEPSEEK;
-    const bool preserve_reasoning = chat_replay_preserves_reasoning(r, calls);
-    buf suffix = {0};
-    if (r && ds4_think_mode_enabled(r->think_mode)) {
-        if (preserve_reasoning) buf_puts(&suffix, reasoning ? reasoning : "");
-        buf_puts(&suffix, "</think>");
-    }
-    buf_puts(&suffix, content ? content : "");
-    append_tool_calls_text_for_syntax(&suffix, syntax, calls,
-                                      r ? &r->tool_orders : NULL);
-    if (syntax != SERVER_MODEL_SYNTAX_GLM) {
-        buf_puts(&suffix, "<｜end▁of▁sentence｜>");
-    }
-    return buf_take(&suffix);
-}
-
 static char *build_responses_visible_assistant_suffix(const request *r,
                                                       const char *content,
                                                       const char *reasoning,
@@ -12538,92 +11836,6 @@ static char *build_responses_visible_assistant_suffix(const request *r,
     return buf_take(&suffix);
 }
 
-/* A Chat Completions client such as pi replays a parsed assistant message, not
- * the exact sampled DSML and hidden-thinking bytes held in KV.  For a verified
- * live image state, the rendered Chat transcript is nevertheless an unambiguous
- * continuation contract: retain it as a byte key and append only the new user
- * suffix to the authoritative sampled frontier on the next request.
- *
- * This deliberately remains memory-only.  Disk checkpoints do not carry
- * image identity, whereas generate_job_inner additionally verifies every
- * image fingerprint and span before it calls the visible-prefix fast path. */
-static void remember_multimodal_chat_checkpoint(
-        server *s, server_slot *slot, const job *j, const char *ctx,
-        uint64_t trace_id, const char *content, const char *reasoning,
-        const tool_calls *calls, const char *finish,
-        const thinking_state *thinking) {
-    if (!s || !slot || !j || j->req.kind != REQ_CHAT ||
-        j->req.api == API_RESPONSES || j->req.image_count == 0 ||
-        !finish || !strcmp(finish, "error") || !strcmp(finish, "length")) {
-        thinking_live_clear(s, slot);
-        return;
-    }
-    /* A custom stop sequence can fire while still inside reasoning, before
-     * </think>.  The live KV then remains in an unclosed think block, so
-     * recording a closed visible assistant turn would let the next same-image
-     * request append the user message inside the unfinished reasoning.  Drop
-     * the checkpoint instead. */
-    if (thinking && thinking->inside) {
-        thinking_live_clear(s, slot);
-        return;
-    }
-    const char *base = request_visible_prompt_text(&j->req);
-    if (!base || !j->req.prompt_text) {
-        thinking_live_clear(s, slot);
-        return;
-    }
-    /* Match Pi's next rendered prompt, rather than the richer raw sampled KV
-     * frontier.  In the no-tool case this specifically excludes hidden
-     * reasoning_content, which Pi reports but the DeepSeek renderer omits. */
-    char *suffix = build_chat_replay_assistant_suffix(
-        &j->req, content, reasoning, calls);
-    if (!suffix) {
-        thinking_live_clear(s, slot);
-        return;
-    }
-    size_t base_len = strlen(base);
-    size_t raw_base_len = strlen(j->req.prompt_text);
-    /* A pending DeepSeek turn ends in <think>.  When Pi replays a normal
-     * no-tool assistant answer, render_deepseek_chat_prompt_text() replaces
-     * that pending tag with </think>; it does not render <think></think>.
-     * Drop the stale opening tag before appending the replay suffix so the
-     * byte key equals the next rendered transcript.  GLM intentionally keeps
-     * its opening <think> and appends the close tag, so it is excluded. */
-    const char *open_think = "<think>";
-    const size_t open_think_len = strlen(open_think);
-    if (j->req.model_syntax == SERVER_MODEL_SYNTAX_DEEPSEEK &&
-        ds4_think_mode_enabled(j->req.think_mode) &&
-        !chat_replay_preserves_reasoning(&j->req, calls)) {
-        if (base_len < open_think_len ||
-            memcmp(base + base_len - open_think_len,
-                   open_think, open_think_len) != 0) {
-            thinking_live_clear(s, slot);
-            free(suffix);
-            return;
-        }
-        /* Keep the raw checkpoint boundary aligned with the visible key: the
-         * visible text dropped this pending tag, so the replay offset must too,
-         * or the next same-image request starts tokenizing seven bytes into
-         * the new user suffix (potentially mid-UTF-8) and corrupts the
-         * continuation. */
-        base_len -= open_think_len;
-        raw_base_len -= open_think_len;
-    }
-    buf visible = {0};
-    buf_append(&visible, base, base_len);
-    buf_puts(&visible, suffix);
-    const size_t raw_len = raw_base_len + strlen(suffix);
-    thinking_live_remember(s, slot, visible.ptr ? visible.ptr : "", raw_len);
-    server_log(DS4_LOG_KVCACHE,
-               "ds4-server: multimodal chat live checkpoint remembered ctx=%s live=%d visible=%zu raw=%zu",
-               ctx, ds4_session_pos(slot->session), visible.len, raw_len);
-    trace_event(s, trace_id,
-                "multimodal chat live checkpoint remembered: live=%d visible=%zu raw=%zu",
-                ds4_session_pos(slot->session), visible.len, raw_len);
-    buf_free(&visible);
-    free(suffix);
-}
-
 /* In thinking mode without tools, old assistant reasoning is intentionally not
  * rendered back into later prompts.  The sampled live graph still contains the
  * reasoning bytes, so the next request would miss the session cache even though
@@ -12652,62 +11864,24 @@ static char *build_toolless_thinking_visible_text(const request *r,
 
     buf visible = {0};
     buf_append(&visible, r->prompt_text, pt_len - tag_len);
-    buf_puts(&visible, "</think>");
-    buf_puts(&visible, content ? content : "");
-    buf_puts(&visible, "<｜end▁of▁sentence｜>");
-    return buf_take(&visible);
-}
-
-/* Variant for tool-context replays (and any prompt that already renders
- * assistant reasoning back into history).  In that regime
- * render_chat_prompt_text() emits open-think + reasoning + close-think for
- * history assistant turns, so the bytes the next request will replay for the
- * turn we just sampled are:
- *
- *   prompt-with-final-<think> + reasoning + </think> + visible-content + eos
- *
- * Remembering these bytes lets the next request hit the thinking-visible path
- * and rebuild the effective prompt from the EXACT live token prefix plus a
- * newly tokenized text suffix.  That is immune to the BPE re-merge divergence
- * that makes an identical-text replay still miss the token-prefix check
- * (sampled reasoning tokenizes autoregressively; replay re-tokenizes the whole
- * string and merges can differ at block boundaries).  Without this bridge a
- * plain thinking turn in a tool conversation permanently diverges the live
- * graph from every future replay, forcing full cold re-prefills. */
-static char *build_preserved_thinking_visible_text(const request *r,
-                                                   const char *content,
-                                                   const char *reasoning) {
-    if (!r || !r->prompt_text) return NULL;
-    if (!ds4_think_mode_enabled(r->think_mode)) return NULL;
-
-    size_t pt_len = strlen(r->prompt_text);
-    const char *think_tag = "<think>";
-    size_t tag_len = strlen(think_tag);
-    if (pt_len < tag_len ||
-        memcmp(r->prompt_text + pt_len - tag_len, think_tag, tag_len) != 0) {
-        return NULL;
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_GLM) {
+        buf_puts(&visible, "<think></think>");
+        append_trimmed_text(&visible, content);
+    } else {
+        buf_puts(&visible, "</think>");
+        buf_puts(&visible, content ? content : "");
+        buf_puts(&visible, "<｜end▁of▁sentence｜>");
     }
-
-    buf visible = {0};
-    buf_puts(&visible, r->prompt_text);
-    buf_puts(&visible, reasoning ? reasoning : "");
-    buf_puts(&visible, "</think>");
-    buf_puts(&visible, content ? content : "");
-    buf_puts(&visible, "<｜end▁of▁sentence｜>");
     return buf_take(&visible);
 }
 
 static void remember_thinking_checkpoint(server *s, server_slot *slot,
                                          const job *j, const char *ctx,
-                                         uint64_t trace_id, const char *content,
-                                         const char *reasoning) {
-    const bool preserved = j->req.has_tools || j->req.prompt_preserves_reasoning;
-    char *visible = preserved
-        ? build_preserved_thinking_visible_text(&j->req, content, reasoning)
-        : build_toolless_thinking_visible_text(&j->req, content);
+                                         uint64_t trace_id, const char *content) {
+    char *visible = build_toolless_thinking_visible_text(&j->req, content);
     if (!visible) return;
 
-    thinking_live_remember(s, slot, visible, strlen(visible));
+    thinking_live_remember(s, slot, visible, &j->req);
     server_log(DS4_LOG_KVCACHE,
                "ds4-server: thinking live checkpoint remembered ctx=%s live=%d visible=%zu",
                ctx, ds4_session_pos(slot->session), strlen(visible));
@@ -12795,9 +11969,9 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
          * a very long conversation from token zero. */
         char *path = NULL;
         ds4_tokens effective = {0};
-        int loaded = kv_cache_try_load_tokenized_text(
-            s, slot, rendered.ptr ? rendered.ptr : "", &canonical,
-            &effective, &path, NULL, false);
+        int loaded = kv_cache_try_load_text(s, slot,
+                                            rendered.ptr ? rendered.ptr : "",
+                                            &effective, &path, NULL, false);
         if (loaded == 0) {
             pthread_mutex_lock(&s->inference_mu);
             ds4_session_invalidate(slot->session);
@@ -13120,7 +12294,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     const int old_pos = ds4_session_pos(slot->session);
     const int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
     const bool live_vision_match =
-        ds4_session_vision_state_matches(slot->session,
+        ds4_session_vision_prefix_matches(slot->session,
                                          j->req.images, j->req.image_count);
     pthread_mutex_unlock(&s->inference_mu);
     trace_cache_diag cache_diag = {0};
@@ -13141,9 +12315,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
      * exact token-prefix match.  Exact token/text/disk matching remains the
      * fallback when the live state is absent or no longer describes the
      * request. */
-    int cached = live_vision_match ?
+    int cached =
         responses_live_visible_prefix_prompt(s, slot, &j->req, old_pos,
-                                              &effective_prompt) : 0;
+                                              &effective_prompt);
     const char *cache_source = cached > 0 ? "responses-visible" : "none";
     if (cached > 0) {
         responses_live_match = "visible-prefix";
@@ -13154,7 +12328,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             responses_live_match_ids = j->req.responses_live_call_ids.len;
         }
     }
-    if (cached == 0 && live_vision_match) {
+    if (cached == 0) {
         cached = responses_live_continuation_prompt(s, slot, &j->req, old_pos,
                                                     &effective_prompt,
                                                     &responses_live_match_ids);
@@ -13164,7 +12338,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (cached > 0) {
         responses_live_continuation = true;
         prompt_for_sync = &effective_prompt;
-    } else if (live_vision_match) {
+    } else {
         cached = anthropic_live_continuation_prompt(s, slot, &j->req, old_pos,
                                                     &effective_prompt,
                                                     &anthropic_live_match_ids);
@@ -13203,7 +12377,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                 ds4_session_common_prefix(slot->session, &j->req.prompt) ==
                     rewind_to &&
                 (!multimodal ||
-                 ds4_session_vision_state_matches(slot->session,
+                 ds4_session_vision_prefix_matches(slot->session,
                                                   j->req.images,
                                                   j->req.image_count));
             pthread_mutex_unlock(&s->inference_mu);
@@ -13224,7 +12398,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             cache_source = cached > 0 ? "memory-token" : "none";
         }
     }
-    if (cached == 0 && live_vision_match) {
+    if (cached == 0) {
         int thinking_cached =
             thinking_live_visible_prefix_prompt(s, slot, &j->req, old_pos,
                                                 &effective_prompt);
@@ -13238,7 +12412,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     int disk_cached = 0;
     char *disk_cache_path = NULL;
     uint8_t disk_cache_ext_flags = 0;
-    if (cached == 0 && live_vision_match) {
+    if (cached == 0) {
         int text_cached = live_text_prefix_prompt(s, slot, &j->req,
                                                   &effective_prompt);
         if (text_cached > 0) {
@@ -13261,23 +12435,20 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    j->req.image_count, cached, prompt_for_sync->len);
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
-    if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
+    if (!multimodal && s->kv.enabled && cached == 0 &&
+        old_pos >= s->kv.opt.min_tokens) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
         kv_cache_store_current(s, slot, "evict");
     }
-    if (cached == 0) {
-        disk_cached = multimodal ?
-            kv_cache_try_load_vision(s, slot, &j->req, &effective_prompt,
-                                     &disk_cache_path,
-                                     &disk_cache_ext_flags) :
-            kv_cache_try_load(s, slot, &j->req, &effective_prompt,
-                              &disk_cache_path,
-                              &disk_cache_ext_flags);
+    if (!multimodal && cached == 0) {
+        disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
+                                        &disk_cache_path,
+                                        &disk_cache_ext_flags);
         if (disk_cached > 0) {
             cached = disk_cached;
-            cache_source = multimodal ? "disk-vision" : "disk-text";
+            cache_source = "disk-text";
             prompt_for_sync = &effective_prompt;
         }
     }
@@ -14217,7 +13388,7 @@ decode_again:
             buf_puts(&visible, j->req.prompt_text ? j->req.prompt_text : "");
             buf_puts(&visible, visible_suffix ? visible_suffix : "");
             responses_live_remember(s, slot, visible.ptr ? visible.ptr : "",
-                                    parsed_calls.len ? &parsed_calls : NULL);
+                                    parsed_calls.len ? &parsed_calls : NULL, &j->req);
             buf_free(&visible);
             free(visible_suffix);
         } else {
@@ -14247,20 +13418,13 @@ decode_again:
         canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "",
                                      parsed_reasoning, &parsed_calls);
-    }
-    if (j->req.image_count != 0) {
-        remember_multimodal_chat_checkpoint(
-            s, slot, j, ctx_span, trace_id,
-            parsed_content ? parsed_content : "", parsed_reasoning,
-            &parsed_calls, final_finish, &thinking);
+        thinking_live_clear(s, slot);
     } else if (parsed_calls.len) {
         thinking_live_clear(s, slot);
     } else if (!parsed_calls.len &&
-               should_remember_thinking_checkpoint(&j->req, &thinking, final_finish,
-                                                   parsed_reasoning)) {
+               should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
         remember_thinking_checkpoint(s, slot, j, ctx_span, trace_id,
-                                     parsed_content ? parsed_content : "",
-                                     parsed_reasoning);
+                                     parsed_content ? parsed_content : "");
     } else if (!parsed_calls.len) {
         thinking_live_clear(s, slot);
     }
@@ -14454,8 +13618,32 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
     if (!s || !slot || !j || slot->busy || slot->assigned) return INT_MIN;
     if (required_slot >= 0 && slot->id != required_slot) return INT_MIN;
     if (required_slot == slot->id) return INT_MAX;
+    /* A visible replay can omit sampled reasoning and shift image positions.
+     * Select its live slot before falling back to token-prefix scoring. The
+     * continuation builder independently verifies image identities on reuse.
+     * The dispatcher already holds tool_mu here. */
+    int live_pos = ds4_session_pos(slot->session);
+    const request *req = &j->req;
+    visible_image_key images;
+    char *key = req->prompt_text ? visible_prompt_key(req, req->prompt_text, &images) : NULL;
+    bool visible_match = false;
+    if (key && req->api == API_RESPONSES) {
+        const live_tool_state *state = &slot->responses_live;
+        visible_match = state->valid && state->live_tokens == live_pos &&
+            state->visible_text && state->visible_len < strlen(key) &&
+            visible_image_prefix_matches(&images, &state->images, state->visible_len) &&
+            byte_prefix_match(key, strlen(key), state->visible_text, state->visible_len);
+    } else if (key && req->kind == REQ_CHAT) {
+        const visible_live_state *state = &slot->thinking_live;
+        visible_match = state->valid && state->live_tokens == live_pos &&
+            state->visible_text && state->visible_len < strlen(key) &&
+            visible_image_prefix_matches(&images, &state->images, state->visible_len) &&
+            byte_prefix_match(key, strlen(key), state->visible_text, state->visible_len);
+    }
+    free(key);
+    if (visible_match) return live_pos;
     if (ds4_session_pos(slot->session) > 0 &&
-        !ds4_session_vision_state_matches(slot->session,
+        !ds4_session_vision_prefix_matches(slot->session,
                                           j->req.images, j->req.image_count)) {
         return -1;
     }
@@ -14670,8 +13858,7 @@ typedef struct {
 } client_arg;
 
 static void append_model_json_values(buf *b, const char *id, const char *name,
-                                     int ctx, int default_tokens,
-                                     bool vision) {
+                                     int ctx, int default_tokens) {
     const int max_completion = default_tokens < ctx ? default_tokens : ctx;
     buf_printf(b,
         "{\"id\":");
@@ -14682,23 +13869,6 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
         "\"owned_by\":\"ds4.c\","
         "\"name\":");
     json_escape(b, name);
-    /* Clients decide whether they may send an image from the advertised input
-     * modalities, and a client that sees text only drops the image before it
-     * ever reaches the server. Report both the OpenRouter-style nested field
-     * and a top-level copy, since discovery code in the wild reads either. */
-    buf_puts(b, vision
-        ? ","
-          "\"architecture\":{"
-              "\"modality\":\"text+image->text\","
-              "\"input_modalities\":[\"text\",\"image\"],"
-              "\"output_modalities\":[\"text\"]},"
-          "\"input_modalities\":[\"text\",\"image\"]"
-        : ","
-          "\"architecture\":{"
-              "\"modality\":\"text->text\","
-              "\"input_modalities\":[\"text\"],"
-              "\"output_modalities\":[\"text\"]},"
-          "\"input_modalities\":[\"text\"]");
     buf_printf(b,
         ","
         "\"context_length\":%d,"
@@ -14729,8 +13899,7 @@ static void append_model_json(buf *b, const server *s, const char *id) {
                              id,
                              ds4_engine_model_name(s->engine),
                              s->ctx_size,
-                             s->default_tokens,
-                             ds4_engine_has_vision(s->engine));
+                             s->default_tokens);
 }
 
 static bool send_model(server *s, int fd, const char *id) {
@@ -14752,18 +13921,6 @@ static bool send_models(server *s, int fd) {
         buf_putc(&b, ',');
         append_model_json(&b, s, "glm-5.2-reasoner");
     } else {
-        /* Clients commonly suppress image input for every model they
-         * classify as DeepSeek, because the upstream DeepSeek API is
-         * text-only, and re-enable it only when the model id carries a
-         * "vision" token. Offer vision-tagged ids first when an encoder is
-         * loaded, so such a client will actually send the image instead of
-         * dropping it and reporting that the model cannot see. */
-        if (ds4_engine_has_vision(s->engine)) {
-            append_model_json(&b, s, "deepseek-v4-flash-vision");
-            buf_putc(&b, ',');
-            append_model_json(&b, s, "deepseek-v4-pro-vision");
-            buf_putc(&b, ',');
-        }
         append_model_json(&b, s, "deepseek-v4-flash");
         buf_putc(&b, ',');
         append_model_json(&b, s, "deepseek-v4-pro");
@@ -14904,8 +14061,7 @@ static void *client_main(void *arg) {
     const size_t model_path_prefix_len = strlen(model_path_prefix);
     if (!strcmp(hr.method, "GET") &&
         !strncmp(hr.path, model_path_prefix, model_path_prefix_len) &&
-        server_model_alias_known(hr.path + model_path_prefix_len,
-                                 ds4_engine_has_vision(s->engine)))
+        server_model_alias_known(hr.path + model_path_prefix_len))
     {
         send_model(s, fd, hr.path + model_path_prefix_len);
         http_request_free(&hr);
@@ -15062,7 +14218,7 @@ static int parse_nonneg_int_arg(const char *s, const char *opt) {
 static float parse_float_arg(const char *s, const char *opt, float minv, float maxv) {
     char *end = NULL;
     float v = strtof(s, &end);
-    if (!s[0] || *end || !isfinite(v) || v < minv || v > maxv) {
+    if (!s[0] || *end || v < minv || v > maxv) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: invalid value for %s: %s", opt, s);
         exit(2);
     }
@@ -15109,11 +14265,7 @@ static void server_close_resources(server *s) {
     }
     kv_cache_close(&s->kv);
     tool_memory_free(&s->tool_mem);
-    for (int i = 0; i < DS4_VEMBED_CACHE_SLOTS; i++) {
-        ds4_vembed_entry *en = &s->vembed_cache[i];
-        ds4_vembed_entry_clear(en);
-    }
-    s->vembed_bytes = 0;
+    server_image_cache_clear(&s->image_cache);
     for (int i = 0; i < s->slot_count; i++) {
         server_slot *slot = &s->slots[i];
         live_tool_state_free(&slot->responses_live);
@@ -15193,10 +14345,6 @@ static server_config parse_options(int argc, char **argv) {
             const char *topic = (i + 1 < argc && argv[i + 1][0] != '-') ?
                 argv[i + 1] : NULL;
             usage(stdout, topic);
-            exit(0);
-        }
-        if (!strcmp(arg, "--version")) {
-            fprintf(stdout, "ds4-server %s\n", DS4_VERSION);
             exit(0);
         }
         char dist_parse_err[256] = {0};
@@ -17175,24 +16323,15 @@ static void test_model_alias_thinking_controls(void) {
     TEST_ASSERT(model_alias_enables_thinking("deepseek-reasoner"));
     TEST_ASSERT(model_alias_enables_thinking("glm-5.2-reasoner"));
     TEST_ASSERT(model_alias_enables_thinking("zai/glm-5.2-reasoner"));
-    TEST_ASSERT(server_model_alias_known("glm-5.2-chat", false));
-    TEST_ASSERT(server_model_alias_known("glm-5.2-reasoner", false));
-    /* Vision-tagged ids exist so clients that gate image input on a "vision"
-     * token in the model id will send images, so they are only known when an
-     * encoder is loaded. */
-    TEST_ASSERT(server_model_alias_known("deepseek-v4-flash-vision", true));
-    TEST_ASSERT(server_model_alias_known("deepseek-v4-pro-vision", true));
-    TEST_ASSERT(!server_model_alias_known("deepseek-v4-flash-vision", false));
-    TEST_ASSERT(!server_model_alias_known("deepseek-v4-pro-vision", false));
-    TEST_ASSERT(server_model_alias_known("deepseek-v4-flash", false));
-    TEST_ASSERT(!model_alias_disables_thinking("deepseek-v4-flash-vision"));
+    TEST_ASSERT(server_model_alias_known("glm-5.2-chat"));
+    TEST_ASSERT(server_model_alias_known("glm-5.2-reasoner"));
     TEST_ASSERT(model_alias_disables_thinking("glm-5.3-flash-chat"));
     TEST_ASSERT(model_alias_disables_thinking("zai/glm-5.3-flash-chat"));
     TEST_ASSERT(model_alias_enables_thinking("glm-5.3-flash-reasoner"));
     TEST_ASSERT(model_alias_enables_thinking("zai/glm-5.3-flash-reasoner"));
-    TEST_ASSERT(server_model_alias_known("glm-5.3-flash", false));
-    TEST_ASSERT(server_model_alias_known("glm-5.3-flash-chat", false));
-    TEST_ASSERT(server_model_alias_known("glm-5.3-flash-reasoner", false));
+    TEST_ASSERT(server_model_alias_known("glm-5.3-flash"));
+    TEST_ASSERT(server_model_alias_known("glm-5.3-flash-chat"));
+    TEST_ASSERT(server_model_alias_known("glm-5.3-flash-reasoner"));
 }
 
 static void test_api_thinking_controls_parse(void) {
@@ -17594,80 +16733,6 @@ static void test_parse_short_dsml_and_canonical_suffix(void) {
     free(content);
     free(reasoning);
     tool_calls_free(&calls);
-    request_free(&r);
-}
-
-static void test_chat_replay_suffix_matches_reasoning_visibility(void) {
-    request r;
-    request_init(&r, REQ_CHAT, 128);
-    r.think_mode = DS4_THINK_HIGH;
-
-    char *suffix = build_chat_replay_assistant_suffix(
-        &r, "visible answer", "hidden reasoning", NULL);
-    TEST_ASSERT(!strcmp(suffix,
-                        "</think>visible answer<｜end▁of▁sentence｜>"));
-    free(suffix);
-
-    /* The pending DeepSeek turn already contains <think>.  A future Pi replay
-     * replaces that tag with </think>, so appending the suffix directly would
-     * produce the wrong <think></think> byte sequence. */
-    chat_msgs first = {0};
-    chat_msg user = {0};
-    user.role = xstrdup("user");
-    user.content = xstrdup("first request");
-    chat_msgs_push(&first, user);
-    char *pending = render_chat_prompt_text(&first, NULL, NULL, DS4_THINK_HIGH);
-    const size_t pending_len = strlen(pending);
-    TEST_ASSERT(pending_len >= 7 &&
-                !memcmp(pending + pending_len - 7, "<think>", 7));
-    r.prompt_text = xstrdup(pending);
-    suffix = build_chat_replay_assistant_suffix(
-        &r, "visible answer", "hidden reasoning", NULL);
-    buf checkpoint = {0};
-    buf_append(&checkpoint, pending, pending_len - 7);
-    buf_puts(&checkpoint, suffix);
-    free(suffix);
-
-    chat_msgs replay = {0};
-    chat_msg replay_user = {0};
-    replay_user.role = xstrdup("user");
-    replay_user.content = xstrdup("first request");
-    chat_msgs_push(&replay, replay_user);
-    chat_msg assistant = {0};
-    assistant.role = xstrdup("assistant");
-    assistant.reasoning = xstrdup("hidden reasoning");
-    assistant.content = xstrdup("visible answer");
-    chat_msgs_push(&replay, assistant);
-    chat_msg next_user = {0};
-    next_user.role = xstrdup("user");
-    next_user.content = xstrdup("strict append-only request");
-    chat_msgs_push(&replay, next_user);
-    char *future = render_chat_prompt_text(&replay, NULL, NULL, DS4_THINK_HIGH);
-    TEST_ASSERT(!strncmp(checkpoint.ptr, future, checkpoint.len));
-    free(future);
-    buf_free(&checkpoint);
-    free(pending);
-    chat_msgs_free(&first);
-    chat_msgs_free(&replay);
-    free(r.prompt_text);
-    r.prompt_text = NULL;
-
-    r.has_tools = true;
-    suffix = build_chat_replay_assistant_suffix(
-        &r, "visible answer", "hidden reasoning", NULL);
-    TEST_ASSERT(!strcmp(suffix,
-                        "hidden reasoning</think>visible answer"
-                        "<｜end▁of▁sentence｜>"));
-    free(suffix);
-
-    r.has_tools = false;
-    r.prompt_preserves_reasoning = true;
-    suffix = build_chat_replay_assistant_suffix(
-        &r, "visible answer", "hidden reasoning", NULL);
-    TEST_ASSERT(!strcmp(suffix,
-                        "hidden reasoning</think>visible answer"
-                        "<｜end▁of▁sentence｜>"));
-    free(suffix);
     request_free(&r);
 }
 
@@ -19479,7 +18544,7 @@ static void test_tool_history_validation_handles_large_replays(void) {
 static void test_model_metadata_clamps_completion_to_context(void) {
     buf b = {0};
     append_model_json_values(&b, "deepseek-v4-flash", "DeepSeek V4 Flash",
-                             32768, 393216, false);
+                             32768, 393216);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":32768") != NULL);
@@ -19488,37 +18553,12 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 
     append_model_json_values(&b, "deepseek-v4-pro", "DeepSeek V4 Pro",
-                             100000, 4096, false);
+                             100000, 4096);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":100000") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":4096") != NULL);
     buf_free(&b);
-}
-
-static void test_model_metadata_advertises_image_input_with_vision(void) {
-    /* Clients gate image sending on the advertised modalities: OpenAI-style
-     * agents that read text-only capabilities strip the image from the
-     * request, so the server never gets a chance to refuse or accept it. */
-    buf vision = {0};
-    append_model_json_values(&vision, "deepseek-v4-flash", "DeepSeek V4 Flash",
-                             32768, 4096, true);
-    TEST_ASSERT(strstr(vision.ptr,
-                       "\"input_modalities\":[\"text\",\"image\"]") != NULL);
-    TEST_ASSERT(strstr(vision.ptr, "\"architecture\":{") != NULL);
-    TEST_ASSERT(strstr(vision.ptr,
-                       "\"modality\":\"text+image->text\"") != NULL);
-    buf_free(&vision);
-
-    /* Without a vision encoder the server must not claim image input, or
-     * clients will send images that can only be rejected. */
-    buf text = {0};
-    append_model_json_values(&text, "deepseek-v4-flash", "DeepSeek V4 Flash",
-                             32768, 4096, false);
-    TEST_ASSERT(strstr(text.ptr, "\"input_modalities\":[\"text\"]") != NULL);
-    TEST_ASSERT(strstr(text.ptr, "\"image\"") == NULL);
-    TEST_ASSERT(strstr(text.ptr, "\"modality\":\"text->text\"") != NULL);
-    buf_free(&text);
 }
 
 static void test_live_prefix_rewind_target(void) {
@@ -19818,158 +18858,27 @@ static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
     request_free(&r);
 }
 
-
-/* A whitespace-only thinking channel must render back as empty so the
- * reconstituted prompt matches a cleanly sampled live KV (the cache-miss
- * bug: the model's separator token desyncs byte-prefix matching). */
-static void test_thinking_whitespace_renders_empty(void) {
-    TEST_ASSERT(!strcmp(thinking_reasoning_visible(NULL), ""));
-    TEST_ASSERT(!strcmp(thinking_reasoning_visible(" "), ""));
-    TEST_ASSERT(!strcmp(thinking_reasoning_visible("\n\t"), ""));
-    TEST_ASSERT(!strcmp(thinking_reasoning_visible("need a tool"), "need a tool"));
-
-    chat_msgs msgs = {0};
-    chat_msg user = {0};
-    user.role = xstrdup("user");
-    user.content = xstrdup("continue");
-    chat_msgs_push(&msgs, user);
-    chat_msg assistant = {0};
-    assistant.role = xstrdup("assistant");
-    assistant.reasoning = xstrdup(" ");
-    assistant.content = xstrdup("");
-    chat_msgs_push(&msgs, assistant);
-
-    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
-    /* The padded space must not survive into the rendered tags: the
-     * boundary is the clean opening tag immediately followed by the
-     * closing one, exactly as the live KV was sampled. */
-    TEST_ASSERT(strstr(prompt, "<think></think>") != NULL);
-    TEST_ASSERT(strstr(prompt, "<think> </think>") == NULL);
-
-    free(prompt);
-    chat_msgs_free(&msgs);
-}
-
-static void test_vembed_cache_store_hit_evict(void) {
-    static server s;   /* only vembed_* fields are exercised; zero init ok */
-    const uint8_t img1[] = "png-bytes-one";
-    const uint8_t img2[] = "png-bytes-two";
-    const uint8_t img3[] = "png-bytes-three";
-    uint64_t h1, h2;
-
-    ds4_vision_embedding emb = {0};
-    emb.token_count = 2;
-    emb.grid_width = 2;
-    emb.grid_height = 1;
-    emb.data = malloc(ds4_vembed_emb_bytes(&emb));
-    TEST_ASSERT(emb.data != NULL);
-    for (uint64_t i = 0; i < ds4_vembed_emb_bytes(&emb) / sizeof(float); i++)
-        emb.data[i] = (float)(i + 1);
-    emb.fingerprint[0] = 0xAB;
-
-    ds4_vembed_hash(img1, sizeof(img1) - 1, &h1, &h2);
-    ds4_vision_embedding out = {0};
-    TEST_ASSERT(!ds4_vembed_lookup(&s, h1, h2, img1,
-                                   sizeof(img1) - 1, &out));
-    TEST_ASSERT(s.vembed_misses == 1);
-    ds4_vembed_store(&s, h1, h2, img1, sizeof(img1) - 1, &emb);
-    TEST_ASSERT(s.vembed_bytes ==
-                ds4_vembed_emb_bytes(&emb) + sizeof(img1) - 1);
-    TEST_ASSERT(ds4_vembed_lookup(&s, h1, h2, img1,
-                                  sizeof(img1) - 1, &out));
-    TEST_ASSERT(s.vembed_hits == 1);
-    TEST_ASSERT(out.data != emb.data);
-    TEST_ASSERT(out.token_count == 2 && out.grid_width == 2 &&
-                out.fingerprint[0] == 0xAB);
-    TEST_ASSERT(!memcmp(out.data, emb.data, (size_t)ds4_vembed_emb_bytes(&emb)));
-    ds4_vision_embedding_free(&out);
-
-    /* A forced hash+length collision with different bytes must still miss. */
-    TEST_ASSERT(sizeof(img1) == sizeof(img2));
-    TEST_ASSERT(!ds4_vembed_lookup(&s, h1, h2, img2,
-                                   sizeof(img2) - 1, &out));
-    TEST_ASSERT(out.data == NULL);
-
-    /* Cap accounting: an entry that cannot ever fit is not cached. */
-    ds4_vision_embedding big = {0};
-    big.token_count = DS4_VEMBED_CACHE_BYTES / (DS4_VEMBED_HIDDEN * sizeof(float)) + 1;
-    big.data = malloc(1);
-    ds4_vembed_hash(img3, sizeof(img3) - 1, &h1, &h2);
-    ds4_vembed_store(&s, h1, h2, img3, sizeof(img3) - 1, &big);
-    TEST_ASSERT(s.vembed_bytes ==
-                ds4_vembed_emb_bytes(&emb) + sizeof(img1) - 1); /* unchanged */
-    free(big.data);
-
-    free(emb.data);
-    for (int i = 0; i < DS4_VEMBED_CACHE_SLOTS; i++)
-        ds4_vembed_entry_clear(&s.vembed_cache[i]);
-    s.vembed_bytes = 0;
-}
-
-static void test_canonical_image_markers_keep_literal_text_exact(void) {
-    const char *literal_a = "\x1e" "DS4_IMAGE_aaaaaaaaaaaaaaaaaaaaaaaa" "\x1f";
-    const char *literal_b = "\x1e" "DS4_IMAGE_bbbbbbbbbbbbbbbbbbbbbbbb" "\x1f";
-    /* No images: two different literal strings must not select one frontier. */
-    TEST_ASSERT(!byte_prefix_match(literal_b, strlen(literal_b),
-                                   literal_a, strlen(literal_a)));
-
-    server_image_inputs images = {0};
-    char first[SERVER_IMAGE_MARKER_BYTES], second[SERVER_IMAGE_MARKER_BYTES];
-    /* Minimal valid 1x1 PNG: the push path sniffs the real format and
-     * rejects placeholder bytes. */
-    const char *tiny_png =
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAC"
-        "hwGA60e6kgAAAABJRU5ErkJggg==";
-    TEST_ASSERT(server_image_inputs_push_base64(&images, "image/png", tiny_png, first));
-    TEST_ASSERT(server_image_inputs_push_base64(&images, "image/png", tiny_png, second));
-    char prefix[256], replay[256], changed[256];
-    snprintf(prefix, sizeof(prefix), "%s literal %s end", first, literal_a);
-    snprintf(replay, sizeof(replay), "%s literal %s end next", second, literal_a);
-    snprintf(changed, sizeof(changed), "%s literal %s end next", second, literal_b);
-    size_t original_len = strlen(prefix);
-    /* These offsets represent only the known parser-inserted markers. */
-    canonicalize_image_marker(prefix);
-    canonicalize_image_marker(replay);
-    canonicalize_image_marker(changed);
-    TEST_ASSERT(strlen(prefix) == original_len);
-    TEST_ASSERT(strstr(prefix, literal_a) != NULL);
-    TEST_ASSERT(byte_prefix_match(replay, strlen(replay), prefix, original_len));
-    TEST_ASSERT(!byte_prefix_match(changed, strlen(changed), prefix, original_len));
-    TEST_ASSERT(!byte_prefix_match(replay + 1, strlen(replay + 1), prefix, original_len));
-    TEST_ASSERT(!byte_prefix_match(replay, original_len - 1, prefix, original_len));
-    canonicalize_image_marker(prefix); /* Idempotent. */
-    TEST_ASSERT(byte_prefix_match(replay, strlen(replay), prefix, original_len));
-    server_image_inputs_free(&images);
-}
-
 static void test_thinking_checkpoint_remember_gate(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
     r.think_mode = DS4_THINK_HIGH;
     thinking_state st = {.inside = true};
 
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length", "why"));
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop", "why"));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length"));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
 
     st.inside = false;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length", "why"));
-    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop", "why"));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length"));
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
 
-    /* Toolless replay drops reasoning: the visible-only bridge still fires
-     * with empty reasoning. */
-    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop", ""));
-
-    /* Preserved-reasoning regime needs the sampled bytes to build the key. */
     r.prompt_preserves_reasoning = true;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop", ""));
-    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop", "why"));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
     r.prompt_preserves_reasoning = false;
     r.has_tools = true;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop", NULL));
-    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop", "why"));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
     r.has_tools = false;
     r.think_mode = DS4_THINK_NONE;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop", "why"));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
 
     request_free(&r);
 }
@@ -20177,10 +19086,10 @@ static void test_kv_stub_file(const char *dir, const char *sha,
     free(path);
 }
 
-static void test_kv_text_stub_file_model_ext(
-        const char *dir, const char *text,
-        uint8_t model_id, uint8_t reason, uint8_t ext_flags,
-        uint32_t tokens, uint64_t payload_bytes) {
+static void test_kv_text_stub_file_model(const char *dir, const char *text,
+                                         uint8_t model_id, uint8_t reason,
+                                         uint32_t tokens,
+                                         uint64_t payload_bytes) {
     char sha[41];
     sha1_bytes_hex(text, strlen(text), sha);
     char name[44];
@@ -20194,7 +19103,7 @@ static void test_kv_text_stub_file_model_ext(
     }
 
     uint8_t h[KV_CACHE_FIXED_HEADER];
-    ds4_kvstore_fill_header(h, model_id, 2, reason, ext_flags, tokens, 0,
+    ds4_kvstore_fill_header(h, model_id, 2, reason, 0, tokens, 0,
                             32768, 100, 100, payload_bytes);
     uint8_t text_len[4];
     le_put32(text_len, (uint32_t)strlen(text));
@@ -20208,285 +19117,10 @@ static void test_kv_text_stub_file_model_ext(
     free(path);
 }
 
-static void test_kv_text_stub_file_model(const char *dir, const char *text,
-                                         uint8_t model_id, uint8_t reason,
-                                         uint32_t tokens,
-                                         uint64_t payload_bytes) {
-    test_kv_text_stub_file_model_ext(dir, text, model_id, reason, 0,
-                                     tokens, payload_bytes);
-}
-
 static void test_kv_text_stub_file(const char *dir, const char *text,
                                    uint8_t reason,
                                    uint32_t tokens, uint64_t payload_bytes) {
     test_kv_text_stub_file_model(dir, text, 0, reason, tokens, payload_bytes);
-}
-
-typedef struct {
-    int load_calls;
-    int render_calls;
-    int load_result[2];
-    const char *canonical;
-    char seen[2][96];
-} test_token_text_retry_probe;
-
-static test_token_text_retry_probe *test_token_text_probe;
-
-static int test_token_text_load(server *s, server_slot *slot,
-                                const char *text, ds4_tokens *effective,
-                                char **path, uint8_t *flags,
-                                bool responses_protocol) {
-    (void)s;
-    (void)slot;
-    (void)responses_protocol;
-    test_token_text_retry_probe *p = test_token_text_probe;
-    TEST_ASSERT(p != NULL);
-    if (!p) return 0;
-    const int call = p->load_calls++;
-    TEST_ASSERT(call < 2);
-    if (call < 2) {
-        snprintf(p->seen[call], sizeof(p->seen[call]), "%s", text ? text : "");
-        const int loaded = p->load_result[call];
-        if (loaded > 0) {
-            if (effective) ds4_tokens_push(effective, 4242);
-            if (path) *path = xstrdup("canonical-hit.kv");
-            if (flags) *flags = 0xa5;
-        }
-        return loaded;
-    }
-    return 0;
-}
-
-static char *test_token_text_render(ds4_engine *engine,
-                                    const ds4_tokens *tokens,
-                                    size_t *out_len) {
-    (void)engine;
-    (void)tokens;
-    test_token_text_retry_probe *p = test_token_text_probe;
-    TEST_ASSERT(p != NULL);
-    if (!p) return xstrdup("");
-    p->render_calls++;
-    const char *text = p->canonical ? p->canonical : "";
-    if (out_len) *out_len = strlen(text);
-    return xstrdup(text);
-}
-
-static int test_token_text_retry(test_token_text_retry_probe *probe,
-                                 bool cache_enabled,
-                                 const char *raw_text,
-                                 const char *canonical_text) {
-    memset(probe, 0, sizeof(*probe));
-    probe->canonical = canonical_text;
-    server s = {0};
-    s.kv.enabled = cache_enabled;
-    server_slot slot = {0};
-    ds4_tokens prompt = {0};
-    test_token_text_probe = probe;
-    int loaded = kv_cache_try_load_tokenized_text_with(
-        &s, &slot, raw_text, &prompt, NULL, NULL, NULL, false,
-        test_token_text_load, test_token_text_render);
-    test_token_text_probe = NULL;
-    return loaded;
-}
-
-static void test_token_text_cache_retry_control_flow(void) {
-    test_token_text_retry_probe p;
-
-    memset(&p, 0, sizeof(p));
-    p.load_result[0] = 512;
-    p.canonical = "canonical";
-    server s = {0};
-    s.kv.enabled = true;
-    server_slot slot = {0};
-    ds4_tokens prompt = {0};
-    test_token_text_probe = &p;
-    TEST_ASSERT(kv_cache_try_load_tokenized_text_with(
-                    &s, &slot, "raw", &prompt, NULL, NULL, NULL, false,
-                    test_token_text_load, test_token_text_render) == 512);
-    test_token_text_probe = NULL;
-    TEST_ASSERT(p.load_calls == 1);
-    TEST_ASSERT(p.render_calls == 0);
-    TEST_ASSERT(!strcmp(p.seen[0], "raw"));
-
-    TEST_ASSERT(test_token_text_retry(&p, true, "same", "same") == 0);
-    TEST_ASSERT(p.load_calls == 1);
-    TEST_ASSERT(p.render_calls == 1);
-    TEST_ASSERT(!strcmp(p.seen[0], "same"));
-
-    memset(&p, 0, sizeof(p));
-    p.load_result[1] = 768;
-    p.canonical = "canonical";
-    s.kv.enabled = true;
-    ds4_tokens effective = {0};
-    char *path = NULL;
-    uint8_t flags = 0;
-    test_token_text_probe = &p;
-    TEST_ASSERT(kv_cache_try_load_tokenized_text_with(
-                    &s, &slot, "raw", &prompt, &effective, &path, &flags, false,
-                    test_token_text_load, test_token_text_render) == 768);
-    test_token_text_probe = NULL;
-    TEST_ASSERT(p.load_calls == 2);
-    TEST_ASSERT(p.render_calls == 1);
-    TEST_ASSERT(!strcmp(p.seen[0], "raw"));
-    TEST_ASSERT(!strcmp(p.seen[1], "canonical"));
-    TEST_ASSERT(effective.len == 1 && effective.v[0] == 4242);
-    TEST_ASSERT(path != NULL && !strcmp(path, "canonical-hit.kv"));
-    TEST_ASSERT(flags == 0xa5);
-    ds4_tokens_free(&effective);
-    free(path);
-
-    TEST_ASSERT(test_token_text_retry(&p, false, "raw", "canonical") == 0);
-    TEST_ASSERT(p.load_calls == 1);
-    TEST_ASSERT(p.render_calls == 0);
-    TEST_ASSERT(!strcmp(p.seen[0], "raw"));
-}
-
-static void test_vision_kv_key_requires_exact_image_identity(void) {
-    const int embd = ds4_engine_embd_dim(NULL);
-    TEST_ASSERT(embd > 0);
-    if (embd <= 0) return;
-    float *conditioning = calloc((size_t)embd, sizeof(conditioning[0]));
-    TEST_ASSERT(conditioning != NULL);
-    if (!conditioning) return;
-    ds4_vision_embedding embedding = {
-        .data = conditioning,
-        .token_count = 1,
-    };
-    TEST_ASSERT(vision_embedding_fingerprint_state(NULL, &embedding));
-    TEST_ASSERT(embedding.state_fingerprint_valid);
-    uint8_t first_state_fingerprint[32];
-    memcpy(first_state_fingerprint, embedding.state_fingerprint,
-           sizeof(first_state_fingerprint));
-    conditioning[embd - 1] = 1.0f;
-    TEST_ASSERT(vision_embedding_fingerprint_state(NULL, &embedding));
-    TEST_ASSERT(embedding.state_fingerprint_valid);
-    TEST_ASSERT(memcmp(first_state_fingerprint, embedding.state_fingerprint,
-                       sizeof(first_state_fingerprint)) != 0);
-    free(conditioning);
-
-    ds4_vision_span image = {0};
-    image.token_start = 128;
-    image.embedding.token_count = 576;
-    for (size_t i = 0; i < sizeof(image.embedding.fingerprint); i++) {
-        image.embedding.fingerprint[i] = (uint8_t)i;
-        image.embedding.state_fingerprint[i] = (uint8_t)(0xa5u ^ i);
-    }
-    image.embedding.state_fingerprint_valid = true;
-
-    ds4_vision_span invalid = image;
-    invalid.embedding.state_fingerprint_valid = false;
-    char *invalid_key = vision_cache_key_from_text(
-        "decoded token prefix", strlen("decoded token prefix"), &invalid, 1);
-    TEST_ASSERT(invalid_key == NULL);
-    free(invalid_key);
-
-    const char *saved_text = "decoded token prefix";
-    const char *future_text = "decoded token prefix and suffix";
-    char *saved_key = vision_cache_key_from_text(
-        saved_text, strlen(saved_text), &image, 1);
-    char *future_key = vision_cache_key_from_text(
-        future_text, strlen(future_text), &image, 1);
-    TEST_ASSERT(saved_key != NULL && future_key != NULL);
-    TEST_ASSERT(saved_key && future_key &&
-                byte_prefix_match(future_key, strlen(future_key),
-                                  saved_key, strlen(saved_key)));
-
-    ds4_vision_span changed = image;
-    /* The same decoded pixels under different encoder-sidecar state are not
-     * interchangeable: disk identity follows the actual conditioning block. */
-    changed.embedding.state_fingerprint[17] ^= 0xff;
-    char *changed_key = vision_cache_key_from_text(
-        future_text, strlen(future_text), &changed, 1);
-    TEST_ASSERT(changed_key && saved_key &&
-                !byte_prefix_match(changed_key, strlen(changed_key),
-                                   saved_key, strlen(saved_key)));
-
-    ds4_vision_span moved = image;
-    moved.token_start++;
-    char *moved_key = vision_cache_key_from_text(
-        future_text, strlen(future_text), &moved, 1);
-    TEST_ASSERT(moved_key && saved_key &&
-                !byte_prefix_match(moved_key, strlen(moved_key),
-                                   saved_key, strlen(saved_key)));
-
-    ds4_vision_span two_images[2] = {image, image};
-    two_images[1].token_start = 1024;
-    two_images[1].embedding.fingerprint[0] ^= 0x80;
-    two_images[1].embedding.state_fingerprint[0] ^= 0x80;
-    char *appended_key = vision_cache_key_from_text(
-        future_text, strlen(future_text), two_images, 2);
-    TEST_ASSERT(appended_key && saved_key &&
-                !byte_prefix_match(appended_key, strlen(appended_key),
-                                   saved_key, strlen(saved_key)));
-    TEST_ASSERT(saved_key &&
-                !byte_prefix_match(future_text, strlen(future_text),
-                                   saved_key, strlen(saved_key)));
-
-    char tmpl[] = "/tmp/ds4-kv-vision-identity-test.XXXXXX";
-    char *dir = mkdtemp(tmpl);
-    TEST_ASSERT(dir != NULL);
-    if (dir && saved_key) {
-        test_kv_text_stub_file_model_ext(
-            dir, saved_key, 0, KV_REASON_EVICT,
-            KV_EXT_VISION_IDENTITY, 1024, 0);
-        kv_disk_cache kc = {0};
-        kc.enabled = true;
-        kc.dir = xstrdup(dir);
-        kc.opt = kv_cache_default_options();
-        TEST_ASSERT(kv_cache_find_text_prefix_filtered(
-                        &kc, future_key, 2, 32768,
-                        KV_EXT_VISION_IDENTITY, 0) >= 0);
-        /* A text request must not be able to select a vision payload even if
-         * it deliberately starts with the private vision-key bytes. */
-        TEST_ASSERT(kv_cache_find_text_prefix_filtered(
-                        &kc, future_key, 2, 32768,
-                        0, KV_EXT_VISION_IDENTITY) < 0);
-        TEST_ASSERT(kv_cache_find_text_prefix(
-                        &kc, future_key, 2, 32768) < 0);
-        TEST_ASSERT(kv_cache_find_text_prefix_filtered(
-                        &kc, future_text, 2, 32768,
-                        KV_EXT_VISION_IDENTITY, 0) < 0);
-        TEST_ASSERT(kv_cache_find_text_prefix_filtered(
-                        &kc, changed_key, 2, 32768,
-                        KV_EXT_VISION_IDENTITY, 0) < 0);
-        TEST_ASSERT(kv_cache_find_text_prefix_filtered(
-                        &kc, moved_key, 2, 32768,
-                        KV_EXT_VISION_IDENTITY, 0) < 0);
-        TEST_ASSERT(kv_cache_find_text_prefix_filtered(
-                        &kc, appended_key, 2, 32768,
-                        KV_EXT_VISION_IDENTITY, 0) < 0);
-        kv_cache_close(&kc);
-
-        /* The boundary is symmetric: an ordinary text payload must not be
-         * accepted by the image-conditioned loader. */
-        test_kv_text_stub_file_model_ext(
-            dir, saved_key, 0, KV_REASON_EVICT, 0, 1024, 0);
-        memset(&kc, 0, sizeof(kc));
-        kc.enabled = true;
-        kc.dir = xstrdup(dir);
-        kc.opt = kv_cache_default_options();
-        TEST_ASSERT(kv_cache_find_text_prefix_filtered(
-                        &kc, future_key, 2, 32768,
-                        0, KV_EXT_VISION_IDENTITY) >= 0);
-        TEST_ASSERT(kv_cache_find_text_prefix_filtered(
-                        &kc, future_key, 2, 32768,
-                        KV_EXT_VISION_IDENTITY, 0) < 0);
-        kv_cache_close(&kc);
-
-        char sha[41], name[44];
-        sha1_bytes_hex(saved_key, strlen(saved_key), sha);
-        snprintf(name, sizeof(name), "%.40s.kv", sha);
-        char *path = path_join(dir, name);
-        unlink(path);
-        free(path);
-        rmdir(dir);
-    }
-
-    free(saved_key);
-    free(future_key);
-    free(changed_key);
-    free(moved_key);
-    free(appended_key);
 }
 
 static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
@@ -20497,10 +19131,8 @@ static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
 
     const char *short_text = "transcript prefix";
     const char *long_text = "transcript prefix with sampled token bytes";
-    const char *canonical_text = "prefix <｜Assistant｜> canonical bytes";
     test_kv_text_stub_file(dir, short_text, KV_REASON_COLD, 512, 0);
     test_kv_text_stub_file(dir, long_text, KV_REASON_COLD, 768, 0);
-    test_kv_text_stub_file(dir, canonical_text, KV_REASON_CONTINUED, 1024, 0);
 
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -20514,30 +19146,20 @@ static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
     TEST_ASSERT(idx >= 0 && kc.entry[idx].tokens == 768);
     TEST_ASSERT(idx >= 0 && kc.entry[idx].text_bytes == strlen(long_text));
     TEST_ASSERT(kv_cache_find_text_prefix(&kc, "transcript prefiX", 2, 32768) < 0);
-    TEST_ASSERT(kv_cache_find_text_prefix(
-        &kc, "prefix <|assistant|> canonical bytes suffix", 2, 32768) < 0);
-    idx = kv_cache_find_text_prefix(
-        &kc, "prefix <｜Assistant｜> canonical bytes suffix", 2, 32768);
-    TEST_ASSERT(idx >= 0 && kc.entry[idx].tokens == 1024);
 
     kv_cache_close(&kc);
-    char short_sha[41], long_sha[41], canonical_sha[41];
+    char short_sha[41], long_sha[41];
     sha1_bytes_hex(short_text, strlen(short_text), short_sha);
     sha1_bytes_hex(long_text, strlen(long_text), long_sha);
-    sha1_bytes_hex(canonical_text, strlen(canonical_text), canonical_sha);
-    char short_name[44], long_name[44], canonical_name[44];
+    char short_name[44], long_name[44];
     snprintf(short_name, sizeof(short_name), "%.40s.kv", short_sha);
     snprintf(long_name, sizeof(long_name), "%.40s.kv", long_sha);
-    snprintf(canonical_name, sizeof(canonical_name), "%.40s.kv", canonical_sha);
     char *short_path = path_join(dir, short_name);
     char *long_path = path_join(dir, long_name);
-    char *canonical_path = path_join(dir, canonical_name);
     unlink(short_path);
     unlink(long_path);
-    unlink(canonical_path);
     free(short_path);
     free(long_path);
-    free(canonical_path);
     rmdir(dir);
 }
 
@@ -21155,113 +19777,6 @@ static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
     chat_msgs_free(&history_msgs);
 }
 
-static void test_preserved_thinking_canonical_matches_future_prompt(void) {
-    chat_msgs prefix_msgs = {0};
-    chat_msg u1 = {0};
-    u1.role = xstrdup("user");
-    u1.content = xstrdup("Check the logs.");
-    chat_msgs_push(&prefix_msgs, u1);
-    char *prompt_text = render_chat_prompt_text(&prefix_msgs, "{}", NULL,
-                                                DS4_THINK_HIGH);
-    size_t pt_len = strlen(prompt_text);
-    TEST_ASSERT(pt_len >= 7 && !memcmp(prompt_text + pt_len - 7, "<think>", 7));
-
-    const char *reasoning = "Reading the log now...";
-    const char *content = "Nothing failed.";
-
-    request r;
-    request_init(&r, REQ_CHAT, 128);
-    r.think_mode = DS4_THINK_HIGH;
-    r.has_tools = true;
-    r.prompt_text = xstrdup(prompt_text);
-    char *visible = build_preserved_thinking_visible_text(&r, content, reasoning);
-    TEST_ASSERT(visible != NULL);
-    request_free(&r);
-
-    chat_msgs history_msgs = {0};
-    chat_msg h_user = {0};
-    h_user.role = xstrdup("user");
-    h_user.content = xstrdup("Check the logs.");
-    chat_msgs_push(&history_msgs, h_user);
-    chat_msg h_asst = {0};
-    h_asst.role = xstrdup("assistant");
-    h_asst.reasoning = xstrdup(reasoning);
-    h_asst.content = xstrdup(content);
-    chat_msgs_push(&history_msgs, h_asst);
-    chat_msg h_user2 = {0};
-    h_user2.role = xstrdup("user");
-    h_user2.content = xstrdup("And now?");
-    chat_msgs_push(&history_msgs, h_user2);
-    char *future = render_chat_prompt_text(&history_msgs, "{}", NULL,
-                                           DS4_THINK_HIGH);
-    size_t vlen = strlen(visible);
-    TEST_ASSERT(strlen(future) > vlen);
-    TEST_ASSERT(!memcmp(future, visible, vlen));
-
-    free(visible);
-    free(future);
-    free(prompt_text);
-    chat_msgs_free(&prefix_msgs);
-    chat_msgs_free(&history_msgs);
-}
-
-static void test_prompt_text_drop_oldest_images(void) {
-    server_image_input imgs[3];
-    memset(imgs, 0, sizeof(imgs));
-    snprintf(imgs[0].marker, sizeof(imgs[0].marker),
-             "\x1e" "DS4_IMAGE_aaaaaaaaaaaaaaaaaaaaaaaa" "\x1f");
-    snprintf(imgs[1].marker, sizeof(imgs[1].marker),
-             "\x1e" "DS4_IMAGE_bbbbbbbbbbbbbbbbbbbbbbbb" "\x1f");
-    snprintf(imgs[2].marker, sizeof(imgs[2].marker),
-             "\x1e" "DS4_IMAGE_cccccccccccccccccccccccc" "\x1f");
-    server_image_input *list[3] = { &imgs[0], &imgs[1], &imgs[2] };
-
-    request r;
-    request_init(&r, REQ_CHAT, 128);
-    buf t = {0};
-    buf_puts(&t, "pre");
-    buf_puts(&t, imgs[0].marker);
-    buf_puts(&t, "mid");
-    buf_puts(&t, imgs[1].marker);
-    buf_puts(&t, "end");
-    buf_puts(&t, imgs[2].marker);
-    buf_puts(&t, "!");
-    r.prompt_text = buf_take(&t);
-
-    TEST_ASSERT(ds4_prompt_text_drop_oldest_images(&r, list, 3, 1));
-    char want[256];
-    snprintf(want, sizeof(want), "pre%s", DS4_VISION_OMIT_NOTE);
-    size_t wl = strlen(want);
-    TEST_ASSERT(strlen(r.prompt_text) > wl);
-    TEST_ASSERT(!memcmp(r.prompt_text, want, wl));
-    /* Markers 2 and 3 survive verbatim. */
-    TEST_ASSERT(strstr(r.prompt_text, imgs[1].marker) != NULL);
-    TEST_ASSERT(strstr(r.prompt_text, imgs[2].marker) != NULL);
-    /* Marker 1 is gone. */
-    TEST_ASSERT(strstr(r.prompt_text, imgs[0].marker) == NULL);
-
-    /* Dropping all: every sentinel replaced, surrounding text intact. */
-    free(r.prompt_text);
-    buf t2 = {0};
-    buf_puts(&t2, "A");
-    buf_puts(&t2, imgs[0].marker);
-    buf_puts(&t2, "B");
-    r.prompt_text = buf_take(&t2);
-    server_image_input *one[1] = { &imgs[0] };
-    TEST_ASSERT(ds4_prompt_text_drop_oldest_images(&r, one, 1, 1));
-    TEST_ASSERT(strstr(r.prompt_text, "A") && strstr(r.prompt_text, "B"));
-    TEST_ASSERT(!strstr(r.prompt_text, imgs[0].marker));
-
-    /* Lost marker is reported, not silently misrendered. */
-    free(r.prompt_text);
-    r.prompt_text = xstrdup("nothing here");
-    TEST_ASSERT(!ds4_prompt_text_drop_oldest_images(&r, one, 1, 1));
-
-    free(r.prompt_text);
-    r.prompt_text = NULL;
-    request_free(&r);
-}
-
 static void test_thinking_canonical_empty_content(void) {
     /* Edge case: model thinks but produces empty content (e.g. tool-less
      * thinking where answer is entirely in reasoning).  Canonical should
@@ -21382,9 +19897,8 @@ static void test_thinking_canonical_multi_turn(void) {
 
 static void test_thinking_canonical_with_tools_preserves_reasoning(void) {
     /* When tools ARE present, reasoning is preserved in re-render.
-     * Plain (no tool-call) thinking turns in a tool conversation now use the
-     * PRESERVED thinking bridge (build_preserved_thinking_visible_text);
-     * tool-call turns keep their own replay path.  Verify the template
+     * The toolless thinking live binding should NOT fire (has_tools gate),
+     * and the tool-call replay path handles it.  Verify the template
      * preserves reasoning when tool_context is true. */
     const char *tool_schemas = "{\"name\":\"bash\"}";
 
@@ -21445,39 +19959,6 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
 static const char test_inline_png_base64[] =
     "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAFUlEQVR4nGP8z8DQwMDAwMAEIkAYABglAYOd/VRoAAAAAElFTkSuQmCC";
 
-static void test_visible_prompt_text_normalizes_image_markers(void) {
-    request a, b;
-    request_init(&a, REQ_CHAT, 32);
-    request_init(&b, REQ_CHAT, 32);
-    server_image_input image_a = {0};
-    server_image_input image_b = {0};
-    snprintf(image_a.marker, sizeof(image_a.marker), "\036DS4_IMAGE_a\037");
-    snprintf(image_b.marker, sizeof(image_b.marker), "\036DS4_IMAGE_b\037");
-    a.prompt_text = xstrdup("before \036DS4_IMAGE_a\037 after");
-    b.prompt_text = xstrdup("before \036DS4_IMAGE_b\037 after");
-    a.images = xmalloc(sizeof(a.images[0]));
-    b.images = xmalloc(sizeof(b.images[0]));
-    memset(a.images, 0, sizeof(a.images[0]));
-    memset(b.images, 0, sizeof(b.images[0]));
-    a.image_count = b.image_count = 1;
-    a.images[0].token_start = b.images[0].token_start = 12;
-    a.images[0].embedding.token_count = b.images[0].embedding.token_count = 64;
-    for (size_t i = 0; i < sizeof(a.images[0].embedding.fingerprint); i++) {
-        a.images[0].embedding.fingerprint[i] = (uint8_t)i;
-        b.images[0].embedding.fingerprint[i] = (uint8_t)i;
-    }
-    server_image_input *inputs_a[] = {&image_a};
-    server_image_input *inputs_b[] = {&image_b};
-    TEST_ASSERT(request_build_visible_prompt_text(&a, inputs_a, 1));
-    TEST_ASSERT(request_build_visible_prompt_text(&b, inputs_b, 1));
-    TEST_ASSERT(a.visible_prompt_text != NULL && b.visible_prompt_text != NULL);
-    TEST_ASSERT(!strcmp(a.visible_prompt_text, b.visible_prompt_text));
-    TEST_ASSERT(strstr(a.visible_prompt_text, "DS4_VISION_") != NULL);
-    TEST_ASSERT(strstr(a.visible_prompt_text, "DS4_IMAGE_a") == NULL);
-    request_free(&a);
-    request_free(&b);
-}
-
 static void test_openai_inline_image_content(void) {
     buf json = {0};
     buf_puts(&json,
@@ -21495,194 +19976,6 @@ static void test_openai_inline_image_content(void) {
     TEST_ASSERT(strstr(msgs.v[0].content, " please") != NULL);
     TEST_ASSERT(msgs.v[0].images.v[0].encoded_len >= 8);
     TEST_ASSERT(!memcmp(msgs.v[0].images.v[0].encoded, "\x89PNG\r\n\x1a\n", 8));
-    chat_msgs_free(&msgs);
-    buf_free(&json);
-}
-
-/* Build a single-user-message OpenAI payload whose image_url is VARIANT. */
-static char *test_image_payload(const char *variant) {
-    buf json = {0};
-    buf_puts(&json,
-        "[{\"role\":\"user\",\"content\":[{\"type\":\"text\","
-        "\"text\":\"describe\"},{\"type\":\"image_url\","
-        "\"image_url\":{\"url\":\"");
-    buf_puts(&json, variant);
-    buf_puts(&json, "\"}}]}]");
-    return buf_take(&json);
-}
-
-static void test_openai_image_accepts_client_data_uri_variants(void) {
-    /* Real OpenAI-compatible clients vary the case of the scheme and media
-     * type, add parameters before ";base64", wrap the payload at 76 columns
-     * (base64.encodebytes), drop '=' padding and use the URL-safe alphabet.
-     * Every one of these used to collapse into "invalid JSON request". */
-    buf wrapped = {0};
-    for (size_t i = 0; test_inline_png_base64[i]; i++) {
-        buf_putc(&wrapped, test_inline_png_base64[i]);
-        if ((i + 1) % 24 == 0) buf_puts(&wrapped, "\n  ");
-    }
-    buf unpadded = {0};
-    for (size_t i = 0; test_inline_png_base64[i]; i++)
-        if (test_inline_png_base64[i] != '=')
-            buf_putc(&unpadded, test_inline_png_base64[i]);
-
-    buf variants[6] = {0};
-    buf_puts(&variants[0], "data:image/png;base64,");
-    buf_puts(&variants[0], test_inline_png_base64);
-    buf_puts(&variants[1], "DATA:IMAGE/PNG;BASE64,");
-    buf_puts(&variants[1], test_inline_png_base64);
-    buf_puts(&variants[2], "data:image/png;charset=utf-8;base64,");
-    buf_puts(&variants[2], test_inline_png_base64);
-    buf_puts(&variants[3], "data:image/png;base64,");
-    buf_puts(&variants[3], wrapped.ptr);
-    buf_puts(&variants[4], "data:image/png;base64,");
-    buf_puts(&variants[4], unpadded.ptr);
-    /* Mislabelled media type: decoding sniffs magic bytes, so a PNG sent as
-     * image/jpeg must still work rather than being refused on the label. */
-    buf_puts(&variants[5], "data:image/jpeg;base64,");
-    buf_puts(&variants[5], test_inline_png_base64);
-
-    for (size_t i = 0; i < sizeof(variants) / sizeof(variants[0]); i++) {
-        char *payload = test_image_payload(variants[i].ptr);
-        const char *p = payload;
-        chat_msgs msgs = {0};
-        TEST_ASSERT(parse_messages(&p, &msgs));
-        TEST_ASSERT(msgs.len == 1);
-        TEST_ASSERT(msgs.v[0].images.len == 1);
-        TEST_ASSERT(msgs.v[0].images.v[0].encoded_len >= 8);
-        TEST_ASSERT(!memcmp(msgs.v[0].images.v[0].encoded,
-                            "\x89PNG\r\n\x1a\n", 8));
-        chat_msgs_free(&msgs);
-        free(payload);
-        buf_free(&variants[i]);
-    }
-    buf_free(&wrapped);
-    buf_free(&unpadded);
-}
-
-static void test_openai_image_block_without_type_is_not_dropped(void) {
-    /* An untyped block carrying an image_url must be treated as an image;
-     * ignoring it would answer from the text alone as if no image was sent. */
-    buf json = {0};
-    buf_puts(&json,
-        "[{\"role\":\"user\",\"content\":[{\"image_url\":{\"url\":"
-        "\"data:image/png;base64,");
-    buf_puts(&json, test_inline_png_base64);
-    buf_puts(&json, "\"}}]}]");
-    const char *p = json.ptr;
-    chat_msgs msgs = {0};
-    TEST_ASSERT(parse_messages(&p, &msgs));
-    TEST_ASSERT(msgs.len == 1);
-    TEST_ASSERT(msgs.v[0].images.len == 1);
-    chat_msgs_free(&msgs);
-    buf_free(&json);
-}
-
-static void test_rejected_image_reports_actionable_error(void) {
-    /* A rejected image must explain itself instead of surfacing the generic
-     * "invalid JSON request", which leaves the client with nothing to fix. */
-    struct {
-        const char *url;
-        const char *needle;
-    } cases[] = {
-        {"https://example.com/a.png", "does not fetch remote URLs"},
-        {"/tmp/a.png", "does not fetch remote URLs"},
-        {"data:image/png,notbase64", "base64"},
-        {"data:image/png;base64,!!!!not base64!!!!", "not valid base64"},
-        {"data:text/plain;base64,aGVsbG8=", "not an image"},
-    };
-    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-        char *payload = test_image_payload(cases[i].url);
-        const char *p = payload;
-        chat_msgs msgs = {0};
-        TEST_ASSERT(!parse_messages(&p, &msgs));
-        char err[256] = {0};
-        chat_msgs_request_error(&msgs, err, sizeof(err));
-        TEST_ASSERT(strstr(err, cases[i].needle) != NULL);
-        TEST_ASSERT(strcmp(err, "invalid JSON request") != 0);
-        chat_msgs_free(&msgs);
-        free(payload);
-    }
-}
-
-static void test_unsupported_image_format_names_the_format(void) {
-    /* GIF/WebP decode is genuinely unavailable, so the error must name the
-     * format rather than blaming the JSON. */
-    const char gif[] = "R0lGODdhAQABAIAAAAAAAAAAACwAAAAAAQABAAACAkQBADs=";
-    buf uri = {0};
-    buf_puts(&uri, "data:image/gif;base64,");
-    buf_puts(&uri, gif);
-    char *payload = test_image_payload(uri.ptr);
-    const char *p = payload;
-    chat_msgs msgs = {0};
-    TEST_ASSERT(!parse_messages(&p, &msgs));
-    char err[256] = {0};
-    chat_msgs_request_error(&msgs, err, sizeof(err));
-    TEST_ASSERT(strstr(err, "GIF") != NULL);
-    TEST_ASSERT(strstr(err, "JPEG or PNG") != NULL);
-    chat_msgs_free(&msgs);
-    free(payload);
-    buf_free(&uri);
-}
-
-static void test_stale_history_image_does_not_reject_request(void) {
-    /* A client replays the whole transcript on every turn, so an image the
-     * server cannot decode must not reject every later request: once it is no
-     * longer the newest message it becomes a text note.  Without this, one
-     * WebP in the history wedges the conversation permanently. */
-    const char *json =
-        "[{\"role\":\"user\",\"content\":[{\"type\":\"text\","
-        "\"text\":\"first\"},{\"type\":\"image_url\",\"image_url\":"
-        "{\"url\":\"data:image/webp;base64,UklGRhIAAABXRUJQVlA4TAUAAAAvAAAAAA==\"}}]},"
-        "{\"role\":\"assistant\",\"content\":\"ok\"},"
-        "{\"role\":\"user\",\"content\":\"second\"}]";
-    const char *p = json;
-    chat_msgs msgs = {0};
-    TEST_ASSERT(parse_messages(&p, &msgs));
-    TEST_ASSERT(msgs.len == 3);
-    /* The undecodable image is replaced in place, so the model is told it was
-     * there rather than answering "first" as if no image had been sent. */
-    TEST_ASSERT(strstr(msgs.v[0].content, "image omitted") != NULL);
-    TEST_ASSERT(strstr(msgs.v[0].content, "WebP") != NULL);
-    TEST_ASSERT(msgs.v[0].images.len == 0);
-    TEST_ASSERT(!strcmp(msgs.v[2].content, "second"));
-    TEST_ASSERT(!msgs.image_error[0]);
-    chat_msgs_free(&msgs);
-
-    /* The same image in the turn being answered is still a hard error: the
-     * caller just attached it and has to be told it did not arrive. */
-    char *newest = test_image_payload(
-        "data:image/webp;base64,UklGRhIAAABXRUJQVlA4TAUAAAAvAAAAAA==");
-    const char *q = newest;
-    chat_msgs bad = {0};
-    TEST_ASSERT(!parse_messages(&q, &bad));
-    char err2[256] = {0};
-    chat_msgs_request_error(&bad, err2, sizeof(err2));
-    TEST_ASSERT(strstr(err2, "WebP") != NULL);
-    chat_msgs_free(&bad);
-    free(newest);
-}
-
-static void test_dropped_image_leaves_no_marker_behind(void) {
-    /* Images are referenced from the text by a nonce marker that rendering
-     * pairs with the decoded image.  Dropping an image on a non-user message
-     * has to take its marker with it, or the marker survives into the prompt
-     * as literal control-character junk. */
-    buf json = {0};
-    buf_puts(&json,
-        "[{\"role\":\"assistant\",\"content\":[{\"type\":\"image_url\","
-        "\"image_url\":{\"url\":\"data:image/png;base64,");
-    buf_puts(&json, test_inline_png_base64);
-    buf_puts(&json, "\"}}]},{\"role\":\"user\",\"content\":\"hi\"}]");
-    const char *p = json.ptr;
-    chat_msgs msgs = {0};
-    TEST_ASSERT(parse_messages(&p, &msgs));
-    TEST_ASSERT(msgs.len == 2);
-    TEST_ASSERT(msgs.v[0].images.len == 0);
-    TEST_ASSERT(strstr(msgs.v[0].content, "DS4_IMAGE") == NULL);
-    TEST_ASSERT(strchr(msgs.v[0].content, '\036') == NULL);
-    TEST_ASSERT(strstr(msgs.v[0].content, "image omitted") != NULL);
-    TEST_ASSERT(strstr(msgs.v[0].content, "user") != NULL);
     chat_msgs_free(&msgs);
     buf_free(&json);
 }
@@ -21738,7 +20031,146 @@ static void test_responses_inline_image_content(void) {
     buf_free(&json);
 }
 
+static void test_visible_image_key(void) {
+    char markers[2][SERVER_IMAGE_MARKER_BYTES] = {"nonce_A", "nonce_B"};
+    request req = {.image_count = 1, .image_markers = markers};
+    visible_image_key first, next;
+    char *a = visible_prompt_key(&req, "xnonce_Ay", &first);
+    TEST_ASSERT(a && first.count == 1 && first.offsets[0] == 1);
+    memcpy(markers[0], "nonce_Z", 8);
+    char *b = visible_prompt_key(&req, "xnonce_Zy", &next);
+    TEST_ASSERT(a && b && !strcmp(a, b));
+    TEST_ASSERT(visible_image_prefix_matches(&next, &first, strlen(a)));
+    free(b);
+    req.image_count = 0;
+    b = visible_prompt_key(&req, a, &next);
+    TEST_ASSERT(b && !strcmp(a, b));
+    TEST_ASSERT(!visible_image_prefix_matches(&next, &first, strlen(a)));
+    free(b);
+    req.image_count = 2;
+    b = visible_prompt_key(&req, "xnonce_Zy-nextnonce_B", &next);
+    TEST_ASSERT(b && byte_prefix_match(b, strlen(b), a, strlen(a)));
+    TEST_ASSERT(visible_image_prefix_matches(&next, &first, strlen(a)));
+    next.offsets[0]++;
+    TEST_ASSERT(!visible_image_prefix_matches(&next, &first, strlen(a)));
+    free(b);
+    free(a);
+    TEST_ASSERT(visible_prompt_key(&req, "marker missing", &next) == NULL);
+
+    request glm = {.model_syntax = SERVER_MODEL_SYNTAX_GLM, .think_mode = DS4_THINK_HIGH,
+                   .prompt_text = "<|user|>hello<|assistant|><think>"};
+    char *visible = build_toolless_thinking_visible_text(&glm, " hello ");
+    TEST_ASSERT(!strcmp(visible, "<|user|>hello<|assistant|><think></think>hello"));
+    free(visible);
+}
+
+static void test_anthropic_tool_image_output(void) {
+    buf json = {0};
+    buf_puts(&json, "[{\"content\":[{\"type\":\"tool_result\","
+                    "\"tool_use_id\":\"tool_test\",\"content\":["
+                    "{\"type\":\"text\",\"text\":\"read image\"},"
+                    "{\"type\":\"image\",\"source\":{\"type\":\"base64\","
+                    "\"media_type\":\"image/png\",\"data\":\"");
+    buf_puts(&json, test_inline_png_base64);
+    buf_puts(&json, "\"}}]}],\"role\":\"user\"}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 1 && msgs.v[0].images.len == 1);
+    TEST_ASSERT(strstr(msgs.v[0].content, "<tool_result>read image") != NULL);
+    TEST_ASSERT(strstr(msgs.v[0].content, msgs.v[0].images.v[0].marker) != NULL);
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+    const char *invalid[] = {
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"content\":["
+        "{\"type\":\"tool_use\",\"name\":\"bash\",\"input\":{}}]}]}]",
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"content\":["
+        "{\"type\":\"tool_result\",\"content\":\"nested\"}]}]}]",
+    };
+    for (size_t i = 0; i < 2; i++) {
+        p = invalid[i];
+        TEST_ASSERT(!parse_anthropic_messages(&p, &msgs));
+        chat_msgs_free(&msgs);
+    }
+}
+
+static void test_responses_tool_image_output(void) {
+    const char *types[] = {"function_call_output", "custom_tool_call_output", "reasoning"};
+    for (size_t i = 0; i < 3; i++) {
+        buf json = {0};
+        buf_puts(&json, "[{\"type\":\"");
+        buf_puts(&json, types[i]);
+        buf_puts(&json, "\",\"call_id\":\"call_test\",\"output\":["
+                       "{\"type\":\"input_text\",\"text\":\"read image\"},"
+                       "{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,");
+        buf_puts(&json, test_inline_png_base64);
+        buf_puts(&json, "\"}]}]");
+        const char *p = json.ptr;
+        chat_msgs msgs = {0};
+        bool ok = parse_responses_input(&p, &msgs, NULL, NULL);
+        TEST_ASSERT(ok == (i < 2));
+        if (ok) {
+            TEST_ASSERT(msgs.len == 1 && !strcmp(msgs.v[0].role, "tool"));
+            TEST_ASSERT(msgs.v[0].images.len == 1);
+            TEST_ASSERT(strstr(msgs.v[0].content, msgs.v[0].images.v[0].marker) != NULL);
+        }
+        chat_msgs_free(&msgs);
+        buf_free(&json);
+    }
+}
+
+static void test_server_image_embedding_cache(void) {
+    server_image_cache cache = {0};
+    uint8_t key = 1;
+    float data[2] = {1.25f, -2.5f};
+    server_image_input input = {.encoded = &key, .encoded_len = 1};
+    ds4_vision_embedding src = {.data = data, .token_count = 1,
+                               .width = 42, .fingerprint = {7}};
+    ds4_vision_embedding out = {0};
+    const size_t budget = 2 * (sizeof(data) + 1);
+    TEST_ASSERT(!server_image_cache_get(&cache, &input, &out));
+    server_image_cache_put(&cache, &input, &src, 2, budget);
+    TEST_ASSERT(server_image_cache_get(&cache, &input, &out));
+    TEST_ASSERT(out.data != data && !memcmp(out.data, data, sizeof(data)));
+    TEST_ASSERT(out.width == 42 && out.fingerprint[0] == 7);
+    out.data[0] = 99;
+    ds4_vision_embedding_free(&out);
+    key = 2;
+    TEST_ASSERT(!server_image_cache_get(&cache, &input, &out));
+    server_image_cache_put(&cache, &input, &src, 2, budget);
+    key = 1;
+    TEST_ASSERT(server_image_cache_get(&cache, &input, &out));
+    TEST_ASSERT(out.data[0] == data[0]);
+    ds4_vision_embedding_free(&out);
+    key = 3;
+    server_image_cache_put(&cache, &input, &src, 2, budget);
+    TEST_ASSERT(cache.bytes == budget);
+    key = 2;
+    TEST_ASSERT(!server_image_cache_get(&cache, &input, &out));
+    key = 1;
+    TEST_ASSERT(server_image_cache_get(&cache, &input, &out));
+    ds4_vision_embedding_free(&out);
+    server_image_cache_clear(&cache);
+    TEST_ASSERT(cache.bytes == 0 && cache.clock == 0);
+    for (key = 1; key <= SERVER_IMAGE_CACHE_ENTRIES + 1; key++)
+        server_image_cache_put(&cache, &input, &src, 2, 4096);
+    TEST_ASSERT(cache.bytes == SERVER_IMAGE_CACHE_ENTRIES * (sizeof(data) + 1));
+    key = 1;
+    TEST_ASSERT(!server_image_cache_get(&cache, &input, &out));
+    server_image_cache_clear(&cache);
+    src.token_count = UINT32_MAX;
+    server_image_cache_put(&cache, &input, &src, UINT32_MAX, SIZE_MAX);
+    TEST_ASSERT(cache.bytes == 0);
+    src.token_count = 1;
+    server_image_cache_put(&cache, &input, &src, 2, sizeof(data));
+    TEST_ASSERT(cache.bytes == 0);
+}
+
 static void ds4_server_unit_tests_run(void) {
+    test_visible_image_key();
+    test_anthropic_tool_image_output();
+    test_responses_tool_image_output();
+    test_server_image_embedding_cache();
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
     test_multimodal_prefill_resume_frontier();
@@ -21791,7 +20223,6 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_stream_handles_multiple_calls();
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
-    test_chat_replay_suffix_matches_reasoning_visibility();
     test_parse_glm_tool_call_message();
     test_dsml_parser_recovers_loose_nested_parameters();
     test_dsml_repair_produces_parseable_calls();
@@ -21826,22 +20257,11 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_tool_map_filters_by_dsml_text();
     test_kv_tool_map_restores_before_prompt_render();
     test_thinking_checkpoint_canonical_matches_future_prompt();
-    test_preserved_thinking_canonical_matches_future_prompt();
-    test_vembed_cache_store_hit_evict();
-    test_canonical_image_markers_keep_literal_text_exact();
-    test_prompt_text_drop_oldest_images();
     test_thinking_canonical_empty_content();
     test_thinking_canonical_multi_turn();
     test_thinking_canonical_with_tools_preserves_reasoning();
     test_thinking_canonical_non_thinking_mode_noop();
-    test_visible_prompt_text_normalizes_image_markers();
     test_openai_inline_image_content();
-    test_openai_image_accepts_client_data_uri_variants();
-    test_openai_image_block_without_type_is_not_dropped();
-    test_rejected_image_reports_actionable_error();
-    test_unsupported_image_format_names_the_format();
-    test_stale_history_image_does_not_reject_request();
-    test_dropped_image_leaves_no_marker_behind();
     test_http_image_paths_and_urls_are_rejected();
     test_anthropic_inline_image_content();
     test_responses_inline_image_content();
@@ -21856,7 +20276,6 @@ static void ds4_server_unit_tests_run(void) {
     test_json_int_handles_non_finite_values();
     test_tool_history_validation_handles_large_replays();
     test_model_metadata_clamps_completion_to_context();
-    test_model_metadata_advertises_image_input_with_vision();
     test_live_prefix_rewind_target();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
@@ -21867,7 +20286,6 @@ static void ds4_server_unit_tests_run(void) {
     test_cancel_running_job_keeps_worker_ownership();
     test_cancel_withdraws_only_pending_decode();
     test_thinking_state_tracks_prompt_and_generated_tags();
-    test_thinking_whitespace_renders_empty();
     test_thinking_checkpoint_remember_gate();
     test_tool_marker_state_ignores_orphan_end();
     test_canonical_rewrite_rebuilds_when_live_tail_changes();
@@ -21878,8 +20296,6 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
-    test_token_text_cache_retry_control_flow();
-    test_vision_kv_key_requires_exact_image_identity();
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();

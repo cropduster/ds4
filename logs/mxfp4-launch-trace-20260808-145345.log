@@ -1,0 +1,504 @@
++ set -uo pipefail
++ export PATH=/opt/homebrew/bin:/usr/local/bin:/Users/michaelkuebbeler/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin
++ PATH=/opt/homebrew/bin:/usr/local/bin:/Users/michaelkuebbeler/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin
++ DS4_DIR=/Users/michaelkuebbeler/ai-workspace/localAI/ds4
++ FINANCEOS_DIR=/Users/michaelkuebbeler/Developer/projects/FinanceOS
++ FINANCEOS_CTL=/Users/michaelkuebbeler/Developer/projects/FinanceOS/scripts/financeos.sh
++ OMLX_BIN=/Users/michaelkuebbeler/.omlx/bin/omlx
++ SEARX_CTL=/Users/michaelkuebbeler/Developer/ai-infra/searxng/searxng-control.command
++ COLIMA_BIN=/opt/homebrew/bin/colima
++ DOCKER_BIN=/opt/homebrew/bin/docker
++ LITELLM_LABEL=de.kuebbeler.litellm
++ LITELLM_PLIST=/Users/michaelkuebbeler/Library/LaunchAgents/de.kuebbeler.litellm.plist
++ COLIMA_LABEL=com.finance-os.colima
++ COLIMA_PLIST=/Users/michaelkuebbeler/Library/LaunchAgents/com.finance-os.colima.plist
+++ id -u
++ USER_DOMAIN=gui/501
++ DS4_HOST=127.0.0.1
++ DS4_PORT=8008
++ OMLX_PORT=2345
++ LITELLM_PORT=4000
++ FINANCEOS_FRONTEND_PORT=4200
++ SEARXNG_PORT=8888
++ DS4_PID_FILE=/Users/michaelkuebbeler/ai-workspace/localAI/ds4/.ds4-server.pid
++ DS4_LOG_DIR=/Users/michaelkuebbeler/ai-workspace/localAI/ds4/logs
++ DS4_LOG_FILE=/Users/michaelkuebbeler/ai-workspace/localAI/ds4/logs/ds4-server.log
++ DS4_KV_DIR=/Users/michaelkuebbeler/.ds4/server-kv
++ DS4_KV_SPACE_MB=32768
++ DS4_CLEAR_KV=1
++ DS4_CTX=32768
++ DS4_STREAMING=0
++ DS4_CACHE_EXPERTS=
++ GGUF_DIR=/Volumes/AIModels/ds4/gguf
++ HYBRID_FILE=DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf
++ Q4_FILE=DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf
++ case "${1:-menu}" in
++ stop_normal_services
++ say 'Wechsel in den Nur-DeepSeek-Modus'
++ printf '\n%s\n' 'Wechsel in den Nur-DeepSeek-Modus'
+
+Wechsel in den Nur-DeepSeek-Modus
++ stop_ds4_server
++ local pid cmd i port candidate_pids candidate_pid candidate_cmd
++ '[' -f /Users/michaelkuebbeler/ai-workspace/localAI/ds4/.ds4-server.pid ']'
++ for port in '"$DS4_PORT"' 8000
++ '[' 8008 = 8000 ']'
++ stop_port_process_if_expected 8008 ds4-server ds4-server
++ local port=8008 expected=ds4-server label=ds4-server pid cmd i
+++ port_pid 8008
+++ lsof -nP -tiTCP:8008 -sTCP:LISTEN
+++ head -1
++ pid=
++ '[' -n '' ']'
++ info 'ds4-server: Port 8008 ist frei'
++ printf '  %s\n' 'ds4-server: Port 8008 ist frei'
+  ds4-server: Port 8008 ist frei
++ return 0
++ port_up 8008
+++ port_pid 8008
+++ lsof -nP -tiTCP:8008 -sTCP:LISTEN
+++ head -1
++ '[' -n '' ']'
++ ok 'ds4-Port 8008 ist frei'
++ printf '  ✅ %s\n' 'ds4-Port 8008 ist frei'
+  ✅ ds4-Port 8008 ist frei
++ for port in '"$DS4_PORT"' 8000
++ '[' 8000 = 8000 ']'
++ '[' 8008 '!=' 8000 ']'
++ continue
+++ pgrep -f '(^|/)ds4-server( |$)'
+++ true
++ candidate_pids=
++ for port in '"$DS4_PORT"' 8000
++ '[' 8008 = 8000 ']'
++ port_up 8008
+++ port_pid 8008
+++ lsof -nP -tiTCP:8008 -sTCP:LISTEN
+++ head -1
++ '[' -n '' ']'
++ ok 'ds4-Port 8008 ist frei'
++ printf '  ✅ %s\n' 'ds4-Port 8008 ist frei'
+  ✅ ds4-Port 8008 ist frei
++ for port in '"$DS4_PORT"' 8000
++ '[' 8000 = 8000 ']'
++ '[' 8008 '!=' 8000 ']'
++ continue
++ '[' -x /Users/michaelkuebbeler/Developer/projects/FinanceOS/scripts/financeos.sh ']'
++ info 'Stoppe FinanceOS (Backend, Frontend, PostgreSQL-Container)'
++ printf '  %s\n' 'Stoppe FinanceOS (Backend, Frontend, PostgreSQL-Container)'
+  Stoppe FinanceOS (Backend, Frontend, PostgreSQL-Container)
++ /Users/michaelkuebbeler/Developer/projects/FinanceOS/scripts/financeos.sh stop
+╔══════════════════════════════╗
+║   FinanceOS wird gestoppt    ║
+╚══════════════════════════════╝
+
+🛑 Stoppe Prozesse...
+   Backend (uvicorn:8000): gestoppt ✅
+   Frontend (ng:4200): gestoppt ✅
+🐘 PostgreSQL... ✅ (Container gestoppt, Daten bleiben erhalten)
+
+✅ FinanceOS vollständig gestoppt.
++ '[' -x /Users/michaelkuebbeler/.omlx/bin/omlx ']'
++ info 'Stoppe oMLX'
++ printf '  %s\n' 'Stoppe oMLX'
+  Stoppe oMLX
++ /Users/michaelkuebbeler/.omlx/bin/omlx stop --timeout 60
+oMLX stopped
++ wait_port_state 2345 down 30
++ local port=2345 expected=down timeout=30 i
+++ seq 1 30
++ for i in '$(seq 1 "$timeout")'
+++ port_up 2345
++++ port_pid 2345
++++ lsof -nP -tiTCP:2345 -sTCP:LISTEN
++++ head -1
+++ '[' -n '' ']'
+++ printf down
++ '[' down = down ']'
++ return 0
++ ok 'oMLX-Port 2345 ist frei'
++ printf '  ✅ %s\n' 'oMLX-Port 2345 ist frei'
+  ✅ oMLX-Port 2345 ist frei
++ port_up 4000
+++ port_pid 4000
+++ lsof -nP -tiTCP:4000 -sTCP:LISTEN
+++ head -1
++ '[' -n 14968 ']'
++ ok 'LiteLLM bleibt aktiv auf Port 4000'
++ printf '  ✅ %s\n' 'LiteLLM bleibt aktiv auf Port 4000'
+  ✅ LiteLLM bleibt aktiv auf Port 4000
++ '[' -x /Users/michaelkuebbeler/Developer/ai-infra/searxng/searxng-control.command ']'
++ wait_port_state 8888 down 30
++ local port=8888 expected=down timeout=30 i
+++ seq 1 30
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ for i in '$(seq 1 "$timeout")'
+++ port_up 8888
++++ port_pid 8888
++++ lsof -nP -tiTCP:8888 -sTCP:LISTEN
++++ head -1
+++ '[' -n 711 ']'
+++ printf up
++ '[' up = down ']'
++ sleep 1
++ return 1
++ true
++ bootout_agent com.finance-os.colima /Users/michaelkuebbeler/Library/LaunchAgents/com.finance-os.colima.plist
++ local label=com.finance-os.colima plist=/Users/michaelkuebbeler/Library/LaunchAgents/com.finance-os.colima.plist
++ agent_loaded com.finance-os.colima
++ launchctl print gui/501/com.finance-os.colima
++ info 'Entlade LaunchAgent com.finance-os.colima'
++ printf '  %s\n' 'Entlade LaunchAgent com.finance-os.colima'
+  Entlade LaunchAgent com.finance-os.colima
++ launchctl bootout gui/501/com.finance-os.colima
++ '[' -x /opt/homebrew/bin/colima ']'
++ /opt/homebrew/bin/colima status
++ info 'Stoppe Colima-VM (Volumes bleiben erhalten)'
++ printf '  %s\n' 'Stoppe Colima-VM (Volumes bleiben erhalten)'
+  Stoppe Colima-VM (Volumes bleiben erhalten)
++ /opt/homebrew/bin/colima stop
+time="2026-08-08T14:54:20+02:00" level=info msg="stopping colima"
+time="2026-08-08T14:54:21+02:00" level=info msg="stopping ..." context=docker
+Stopping 'docker.service', but its triggering units are still active:
+docker.socket
+colima
+time="2026-08-08T14:54:21+02:00" level=info msg="stopping ..." context=vm
+time="2026-08-08T14:54:21+02:00" level=info msg="Sending SIGINT to hostagent process 85441"
+time="2026-08-08T14:54:21+02:00" level=info msg="Waiting for the host agent and the driver processes to shut down"
+time="2026-08-08T14:54:21+02:00" level=info msg="[hostagent] Received SIGINT, shutting down the host agent"
+time="2026-08-08T14:54:21+02:00" level=info msg="[hostagent] Shutting down the host agent"
+time="2026-08-08T14:54:21+02:00" level=info msg="[hostagent] Stopping forwarding \"/var/run/docker.sock\" (guest) to \"/Users/michaelkuebbeler/.colima/default/docker.sock\" (host)"
+time="2026-08-08T14:54:21+02:00" level=info msg="[hostagent] Stopping forwarding \"/var/run/containerd/containerd.sock\" (guest) to \"/Users/michaelkuebbeler/.colima/default/containerd.sock\" (host)"
+time="2026-08-08T14:54:21+02:00" level=info msg="[hostagent] Stopping forwarding \"/var/run/docker.sock\" (guest) to \"/Users/michaelkuebbeler/.colima/docker.sock\" (host)"
+time="2026-08-08T14:54:21+02:00" level=info msg="[hostagent] Unmounting disk \"colima\""
+time="2026-08-08T14:54:21+02:00" level=info msg="[hostagent] Shutting down VZ"
+time="2026-08-08T14:54:21+02:00" level=info msg="[hostagent] [VZ] - vm state change: stopped"
+time="2026-08-08T14:54:21+02:00" level=info msg="Waiting for the instance to shut down"
+time="2026-08-08T14:54:22+02:00" level=info msg="The instance colima has shut down"
+time="2026-08-08T14:54:22+02:00" level=info msg=done
++ stop_port_process_if_expected 4200 ng FinanceOS-Frontend
++ local port=4200 expected=ng label=FinanceOS-Frontend pid cmd i
+++ port_pid 4200
+++ lsof -nP -tiTCP:4200 -sTCP:LISTEN
+++ head -1
++ pid=
++ '[' -n '' ']'
++ info 'FinanceOS-Frontend: Port 4200 ist frei'
++ printf '  %s\n' 'FinanceOS-Frontend: Port 4200 ist frei'
+  FinanceOS-Frontend: Port 4200 ist frei
++ return 0
++ '[' 8008 = 8000 ']'
++ DS4_STREAMING=1
++ DS4_CACHE_EXPERTS=
++ start_ds4_server
++ local pid i
++ '[' -d /Users/michaelkuebbeler/ai-workspace/localAI/ds4 ']'
++ '[' -x /Users/michaelkuebbeler/ai-workspace/localAI/ds4/ds4-server ']'
++ '[' -e /Users/michaelkuebbeler/ai-workspace/localAI/ds4/ds4flash.gguf ']'
++ port_up 8008
+++ port_pid 8008
+++ lsof -nP -tiTCP:8008 -sTCP:LISTEN
+++ head -1
++ '[' -n '' ']'
++ mkdir -p /Users/michaelkuebbeler/ai-workspace/localAI/ds4/logs /Users/michaelkuebbeler/.ds4/server-kv
++ '[' 1 = 1 ']'
++ info 'Leere persistenten KV-Cache: /Users/michaelkuebbeler/.ds4/server-kv'
++ printf '  %s\n' 'Leere persistenten KV-Cache: /Users/michaelkuebbeler/.ds4/server-kv'
+  Leere persistenten KV-Cache: /Users/michaelkuebbeler/.ds4/server-kv
++ rm -f /Users/michaelkuebbeler/.ds4/server-kv/0f1e2880c226c1872427c468ca1b3dad28421dcb.kv /Users/michaelkuebbeler/.ds4/server-kv/1b499f8eaf114f6071fc115b3a54e5bd2f054688.kv /Users/michaelkuebbeler/.ds4/server-kv/1ee4ad3ca28e4d4d9dffb62f362f1be4c575a01e.kv /Users/michaelkuebbeler/.ds4/server-kv/20b51020b5fef9ae1f32f760417a6b0a1173443c.kv /Users/michaelkuebbeler/.ds4/server-kv/245d106176579a39ce052a23678d9a94d8bdf317.kv /Users/michaelkuebbeler/.ds4/server-kv/25baa976d2abe39d12e1a352b32f7e949ec130c7.kv /Users/michaelkuebbeler/.ds4/server-kv/28f79d36b2979cfc8c2040f0c4d4abf36eb803b8.kv /Users/michaelkuebbeler/.ds4/server-kv/44bde103a53fe6314e2930b32735fff5dbaf9390.kv /Users/michaelkuebbeler/.ds4/server-kv/4bb3d47c5f774cd0b3be13b7df8483ebaa0bff9f.kv /Users/michaelkuebbeler/.ds4/server-kv/50dffab8dba3d5502eb961869d75729c8bda9a4d.kv /Users/michaelkuebbeler/.ds4/server-kv/657d8e2b69ee63cb02e386ab68b176d28c50c24b.kv /Users/michaelkuebbeler/.ds4/server-kv/6e218c9005fff648ad567a8a0e669160c00a8e07.kv /Users/michaelkuebbeler/.ds4/server-kv/708fe8809f25d5089e9f5fedd2f6f48c99273303.kv /Users/michaelkuebbeler/.ds4/server-kv/7c4456f861dd7ef8fc157a60eace7c15cd8bbc39.kv /Users/michaelkuebbeler/.ds4/server-kv/7e11f65a63e5345017ed37961c673ad6f0176010.kv /Users/michaelkuebbeler/.ds4/server-kv/9373474d3885406c682e04e306a4afaecd298785.kv /Users/michaelkuebbeler/.ds4/server-kv/a3f4a04b095d3ace77c69dd7a22221b484b8c17a.kv /Users/michaelkuebbeler/.ds4/server-kv/aa4d02016f580fb23a1fcae16ee41d714e8d2276.kv /Users/michaelkuebbeler/.ds4/server-kv/b3b2e3fc4d518eda6b3eb49c457ce9d940714695.kv /Users/michaelkuebbeler/.ds4/server-kv/b623bbb606b0af93176a288e20a6a0fb83e94269.kv /Users/michaelkuebbeler/.ds4/server-kv/c15e29286f7d097db6d2ceb571ac768b0c8226e2.kv /Users/michaelkuebbeler/.ds4/server-kv/c27265bf7109284bcddf1849a9a3b33213525239.kv /Users/michaelkuebbeler/.ds4/server-kv/ceb9e1de51fe8907994cee8efaf554519a658d0c.kv /Users/michaelkuebbeler/.ds4/server-kv/d08f15165179fde75a0e753da3bbc925b2ae75bd.kv /Users/michaelkuebbeler/.ds4/server-kv/d0a1d0c6ec201f7870a0b45c68e6d416e68bd552.kv /Users/michaelkuebbeler/.ds4/server-kv/df724acde736b88262888c6f73b5b5b3837569c4.kv /Users/michaelkuebbeler/.ds4/server-kv/eae5712ff7f4fa1b8bfcf6fc98422eec59ff1e74.kv /Users/michaelkuebbeler/.ds4/server-kv/eee0fe7df15ee9f8431e1b2b79f874c3f3879c57.kv /Users/michaelkuebbeler/.ds4/server-kv/f867f641024fb699afa983773144ab7334a0a4b8.kv
++ info 'Starte ds4-server: Host 127.0.0.1, Kontext 32768, Port 8008'
++ printf '  %s\n' 'Starte ds4-server: Host 127.0.0.1, Kontext 32768, Port 8008'
+  Starte ds4-server: Host 127.0.0.1, Kontext 32768, Port 8008
++ local -a ds4_args
++ ds4_args=(--host "$DS4_HOST" --port "$DS4_PORT" --ctx "$DS4_CTX" --kv-disk-dir "$DS4_KV_DIR" --kv-disk-space-mb "$DS4_KV_SPACE_MB" --chdir "$DS4_DIR")
++ '[' 1 = 1 ']'
++ ds4_args+=(--ssd-streaming)
++ '[' -n '' ']'
++ info 'SSD-Expert-Streaming aktiv; Expert-Cache-Budget: automatisch'
++ printf '  %s\n' 'SSD-Expert-Streaming aktiv; Expert-Cache-Budget: automatisch'
+  SSD-Expert-Streaming aktiv; Expert-Cache-Budget: automatisch
++ pid=15395
++ printf '%s\n' 15395
+++ seq 1 60
++ for i in '$(seq 1 60)'
++ port_up 8008
+++ port_pid 8008
+++ lsof -nP -tiTCP:8008 -sTCP:LISTEN
+++ head -1
++ '[' -n '' ']'
++ kill -0 15395
++ sleep 1
++ for i in '$(seq 1 60)'
++ port_up 8008
+++ port_pid 8008
+++ lsof -nP -tiTCP:8008 -sTCP:LISTEN
+++ head -1
++ '[' -n 15395 ']'
++ ok 'ds4-server läuft auf http://127.0.0.1:8008 (PID 15395)'
++ printf '  ✅ %s\n' 'ds4-server läuft auf http://127.0.0.1:8008 (PID 15395)'
+  ✅ ds4-server läuft auf http://127.0.0.1:8008 (PID 15395)
++ return 0
++ printf '\nTaste drücken zum Schließen ... '
+
+Taste drücken zum Schließen ... + read -r _
++ true

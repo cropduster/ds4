@@ -1,0 +1,41 @@
+ds4: Metal device Apple M4 Max, 128.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: metal SSD streaming cache budget 100.00 GiB capped to 93.00 GiB to stay below the graph working-set pressure budget
+ds4: Metal SSD streaming mode enabled; full model residency and warmup are skipped
+ds4: GLM SSD streaming full resident layers: 2 (7.59 GiB, auto)
+ds4: metal SSD streaming cache target 93.00 GiB; effective 93.00 GiB = 7.59 GiB prefill headroom + 7.59 GiB full layers + 77.81 GiB dynamic cache (5902 experts, 13.50 MiB each)
+ds4: GLM SSD streaming request adjusted to fit memory: full layers 2 -> 2, cache 5902 -> 5765 experts, prefill reserve 7.59 -> 7.59 GiB
+ds4: GLM SSD streaming decode map: global 22.09 GiB (18.00 GiB beyond the active layer window)
+ds4: SSD streaming initial metal model map restricted to token embedding (1 spans, 1.18 GiB tensor span)
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 4.38 GiB (raw 0.00 + compressed 4.38) + buffers 3.16 GiB + resident model 22.09 GiB + expert cache 76.00 GiB + prefill expert reserve 7.59 GiB = 113.23 GiB planned
+ds4: memory detail: ctx=393216 prefill_cap=2048 raw_kv_rows=0 compressed_kv_rows=393216 backend=metal
+0902 20:45:34 ds4-server: context buffers 7728.53 MiB (ctx=393216, backend=metal, prefill_chunk=2048, raw_kv_rows=0, compressed_kv_rows=393216)
+ds4: GLM SSD streaming decode map: global 22.09 GiB (7.82 GiB beyond the active layer window)
+ds4: GLM session ctx=393216 (model max=1048576); full-attention prefill/work cap=4096; compact indexed decode is used beyond the cap
+ds4: GLM graph using compact DSA KV only; expanded full-attention KV cache is skipped
+ds4: GLM graph allocating compact DSA cache: rows=393216 logical_ctx=393216 kv_layers=45 indexer_layers=11 f16 4.38 GiB
+ds4: GLM compact indexed prefill chunk=2048 score_rows=682 score_scratch=255.75 MiB
+0902 20:45:34 ds4-server: KV disk cache /Users/michaelkuebbeler/.ds4/glm53-server-kv (budget=32768 MiB, cross-quant=accept, min=512, cold_max=30000, continued=10000, trim=32, align=2048, hit_half_life=21600s)
+0902 20:45:34 ds4-server: listening on http://0.0.0.0:8008
+0902 20:45:41 ds4-server: kv cache hit text tokens=1825 text=7678 quant=4 key=token-text load=30.6 ms file=/Users/michaelkuebbeler/.ds4/glm53-server-kv/1014cf820fa755b1dbd55f6981dc976ed73c1d79.kv
+0902 20:45:41 ds4-server: chat ctx=1825..1825:0 prompt start
+0902 20:45:41 ds4-server: chat ctx=1825..1825:0 prompt done 0.000s
+0902 20:46:02 ds4-server: chat ctx=1825..1875:50 gen=50 decoding chunk=2.39 t/s avg=2.39 t/s 20.918s
+ds4: warning: streaming expert cache could not mlock all buffers
+ds4:   requested cache: 5765 experts / 76.00 GiB
+ds4:   locked so far:   71.93 GiB
+ds4:   failed buffer:   13.50 MiB (Resource temporarily unavailable)
+ds4:   macOS may page unlocked expert buffers, causing poor or unstable speed
+ds4:   using locked cache cap: 5309 experts / 69.99 GiB
+ds4:   try: --ssd-streaming-cache-experts 70GB
+ds4:   released locked cache margin: 546 experts / 7.20 GiB; runtime cache cap now 4910 experts
+0902 20:46:13 ds4-server: chat ctx=1875..1925:50 gen=100 decoding chunk=4.59 t/s avg=3.14 t/s 31.812s
+0902 20:46:22 ds4-server: chat ctx=1925..1975:50 gen=150 decoding chunk=5.75 t/s avg=3.70 t/s 40.503s
+0902 20:46:33 ds4-server: chat ctx=1975..2025:50 gen=200 decoding chunk=4.50 t/s avg=3.87 t/s 51.616s
+0902 20:46:35 ds4-server: chat ctx=2025..2031:6 gen=206 decoding chunk=3.22 t/s avg=3.85 t/s 53.482s
+0902 20:46:35 ds4-server: thinking live checkpoint remembered ctx=1825..1825:0 live=2032 visible=8392
+0902 20:46:35 ds4-server: chat ctx=1825..1825:0 gen=206 finish=stop 53.482s
+0902 20:47:38 ds4-server: shutdown requested, draining requests
+0902 20:47:38 ds4-server: persisting resident KV cache before shutdown slot=0 tokens=2032
