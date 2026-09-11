@@ -13685,7 +13685,11 @@ decode_again:
                 break;
             }
         }
-        if (kept < ntok && !text_stop && !job_cancelled(j) && strcmp(finish, "error")) {
+        if (completion >= max_tokens ||
+            ds4_session_pos(slot->session) >= ds4_session_ctx(slot->session)) {
+            stop_decode = true;
+        }
+        if (!stop_decode && kept < ntok && !text_stop && !job_cancelled(j) && strcmp(finish, "error")) {
             /* Logits after a rewind belong to the discarded suffix. Re-eval
              * the last kept token before sampling under a different mode. */
             int pos = block_start + kept - (resample ? 1 : 0);
@@ -13698,7 +13702,15 @@ decode_again:
                             kept, ntok - kept, resample);
             }
         }
-        if (stop_decode) break;
+        if (stop_decode) {
+            if (kept < ntok && !text_stop && !job_cancelled(j)) {
+                int pos = block_start + kept;
+                pthread_mutex_lock(&s->inference_mu);
+                ds4_session_rewind(slot->session, pos);
+                pthread_mutex_unlock(&s->inference_mu);
+            }
+            break;
+        }
     }
     server_generation_leave(s);
 

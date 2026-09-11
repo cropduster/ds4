@@ -39552,10 +39552,10 @@ static void embed_prompt(
  * =========================================================================
  *
  * DeepSeek V4 Flash stores a GPT-2 style byte-level BPE tokenizer in GGUF.
- * The implementation below is intentionally small.  It loads token strings
- * and merge ranks from the mmaped file, builds two open-addressed hash tables,
- * and applies BPE to user text.  Chat special tokens are inserted directly by
- * ID; user text goes through BPE.
+ * The implementation below is intentionally small.  It copies token strings
+ * and merge keys into one compact owned arena, builds two open-addressed hash
+ * tables, and applies BPE to user text. Tensor data remains mmap-backed. Chat
+ * special tokens are inserted directly by ID; user text goes through BPE.
  */
 
 typedef struct {
@@ -39658,6 +39658,7 @@ bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix) 
 
 struct ds4_vocab {
     ds4_str *token;
+    char *string_storage;       /* Owns token strings and hash table keys. */
     int n_vocab;
     int bos_id;
     int eos_id;
@@ -39770,6 +39771,10 @@ struct ds4_engine {
     bool mtp_ready;
     bool vision_ready;
     bool vision_map_ready;
+    /* Generation of the Metal model-view set at the time vision_map_ready
+     * was last established; a mismatch means the views were cleared and the
+     * sidecar map must be re-registered. */
+    uint64_t vision_map_generation;
     bool share_session_prefill_workspace;
 #ifndef DS4_NO_GPU
     bool shared_prefill_workspace_ready;
@@ -40755,6 +40760,75 @@ static int vocab_lookup_optional(const ds4_vocab *vocab, const char *text) {
     return token;
 }
 
+static int glm_chat_bos_fallback_id(int gmask_id, int sop_id) {
+    return gmask_id >= 0 ? gmask_id : sop_id;
+}
+
+static size_t vocab_array_storage_bytes(const ds4_model *model,
+                                        ds4_array_ref array) {
+    size_t total = 0;
+    ds4_cursor c = cursor_at(model, array.data_pos);
+    for (uint64_t i = 0; i < array.len; i++) {
+        ds4_str s;
+        if (!cursor_string(&c, &s)) ds4_die(c.error);
+        if (s.len > SIZE_MAX - total) {
+            ds4_die("GGUF tokenizer string data is too large");
+        }
+        total += (size_t)s.len;
+    }
+    return total;
+}
+
+static ds4_str vocab_copy_string(ds4_cursor *c, char **dst,
+                                 size_t *remaining) {
+    ds4_str borrowed;
+    if (!cursor_string(c, &borrowed)) ds4_die(c->error);
+    if (borrowed.len > *remaining) {
+        ds4_die("GGUF tokenizer string data changed while loading");
+    }
+    memcpy(*dst, borrowed.ptr, (size_t)borrowed.len);
+    ds4_str owned = { *dst, borrowed.len };
+    *dst += (size_t)borrowed.len;
+    *remaining -= (size_t)borrowed.len;
+    return owned;
+}
+
+static void vocab_load_string_storage(ds4_vocab *vocab,
+                                      const ds4_model *model,
+                                      ds4_array_ref tokens,
+                                      ds4_array_ref merges) {
+    const size_t token_bytes = vocab_array_storage_bytes(model, tokens);
+    const size_t merge_bytes = vocab_array_storage_bytes(model, merges);
+    if (merge_bytes > SIZE_MAX - token_bytes) {
+        ds4_die("GGUF tokenizer string data is too large");
+    }
+
+    const size_t storage_bytes = token_bytes + merge_bytes;
+    vocab->string_storage = xmalloc(storage_bytes ? storage_bytes : 1);
+    char *dst = vocab->string_storage;
+    size_t remaining = storage_bytes;
+
+    vocab->n_vocab = (int)tokens.len;
+    vocab->token = xcalloc((size_t)vocab->n_vocab, sizeof(vocab->token[0]));
+    table_init(&vocab->token_to_id, tokens.len);
+
+    ds4_cursor c = cursor_at(model, tokens.data_pos);
+    for (int i = 0; i < vocab->n_vocab; i++) {
+        vocab->token[i] = vocab_copy_string(&c, &dst, &remaining);
+        table_put(&vocab->token_to_id, vocab->token[i], i);
+    }
+
+    table_init(&vocab->merge_rank, merges.len);
+    c = cursor_at(model, merges.data_pos);
+    for (uint64_t i = 0; i < merges.len; i++) {
+        ds4_str merge = vocab_copy_string(&c, &dst, &remaining);
+        table_put(&vocab->merge_rank, merge, (int)i);
+    }
+    if (remaining != 0) {
+        ds4_die("GGUF tokenizer string data changed while loading");
+    }
+}
+
 /* Load token strings, special token ids, and merge ranks from GGUF metadata. */
 
 static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
@@ -40822,7 +40896,9 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
 
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         if (!model_get_token_id(model, "tokenizer.ggml.bos_token_id", &vocab->bos_id)) {
-            vocab->bos_id = vocab_lookup_optional(vocab, "<sop>");
+            vocab->bos_id = glm_chat_bos_fallback_id(
+                    vocab_lookup_optional(vocab, "[gMASK]"),
+                    vocab_lookup_optional(vocab, "<sop>"));
         }
         if (!model_get_token_id(model, "tokenizer.ggml.eos_token_id", &vocab->eos_id)) {
             vocab->eos_id = vocab_lookup_optional(vocab, "<|endoftext|>");
@@ -40870,6 +40946,7 @@ static void vocab_free(ds4_vocab *vocab) {
     free(vocab->token);
     table_free(&vocab->token_to_id);
     table_free(&vocab->merge_rank);
+    free(vocab->string_storage);
     memset(vocab, 0, sizeof(*vocab));
 }
 
@@ -40879,7 +40956,8 @@ static void vocab_free(ds4_vocab *vocab) {
 static void chat_push_bos_sequence(const ds4_vocab *vocab, token_vec *out) {
     if (vocab->bos_id < 0) return;
     token_vec_push(out, vocab->bos_id);
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && vocab->sop_id >= 0)
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
+        vocab->sop_id >= 0 && vocab->sop_id != vocab->bos_id)
         token_vec_push(out, vocab->sop_id);
 }
 
@@ -41087,6 +41165,50 @@ void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out
     tokenize_rendered_chat_vocab(&e->vocab, text, out);
 }
 
+#ifdef DS4_TEST_HOOKS
+bool ds4_test_glm_chat_preamble(void) {
+    static const ds4_str gmask = {"[gMASK]", 7};
+    static const ds4_str sop = {"<sop>", 5};
+    const ds4_shape saved_shape = g_ds4_shape;
+    ds4_vocab vocab = {0};
+    ds4_vocab sop_only = {0};
+    token_vec direct = {0};
+    token_vec rendered = {0};
+    token_vec shared = {0};
+
+    table_init(&vocab.token_to_id, 2);
+    table_put(&vocab.token_to_id, gmask, 154822);
+    table_put(&vocab.token_to_id, sop, 154824);
+    vocab.bos_id = glm_chat_bos_fallback_id(
+            vocab_lookup_optional(&vocab, "[gMASK]"),
+            vocab_lookup_optional(&vocab, "<sop>"));
+    vocab.sop_id = vocab_lookup_optional(&vocab, "<sop>");
+
+    g_ds4_shape.family = DS4_MODEL_FAMILY_GLM_DSA;
+    chat_push_bos_sequence(&vocab, &direct);
+    tokenize_rendered_chat_vocab(&vocab, "[gMASK]<sop>", &rendered);
+    bool ok = direct.len == 2 && direct.v[0] == 154822 && direct.v[1] == 154824 &&
+              rendered.len == 2 && rendered.v[0] == 154822 && rendered.v[1] == 154824;
+
+    table_init(&sop_only.token_to_id, 1);
+    table_put(&sop_only.token_to_id, sop, 154824);
+    sop_only.bos_id = glm_chat_bos_fallback_id(
+            vocab_lookup_optional(&sop_only, "[gMASK]"),
+            vocab_lookup_optional(&sop_only, "<sop>"));
+    sop_only.sop_id = vocab_lookup_optional(&sop_only, "<sop>");
+    chat_push_bos_sequence(&sop_only, &shared);
+    ok = ok && shared.len == 1 && shared.v[0] == 154824;
+
+    token_vec_free(&shared);
+    token_vec_free(&rendered);
+    token_vec_free(&direct);
+    table_free(&sop_only.token_to_id);
+    table_free(&vocab.token_to_id);
+    g_ds4_shape = saved_shape;
+    return ok;
+}
+#endif
+
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
     chat_push_bos_sequence(&e->vocab, tokens);
 }
@@ -41291,6 +41413,129 @@ static bool vocab_token_is_literal_special(ds4_str s) {
     }
     return false;
 }
+
+#ifdef DS4_TEST_HOOKS
+static size_t ds4_test_write_gguf_string(uint8_t *dst, size_t pos,
+                                         const char *s) {
+    const uint64_t len = (uint64_t)strlen(s);
+    memcpy(dst + pos, &len, sizeof(len));
+    pos += sizeof(len);
+    memcpy(dst + pos, s, (size_t)len);
+    return pos + (size_t)len;
+}
+
+static bool ds4_test_vocab_keys_are_detached(const str_i32_table *table,
+                                             uintptr_t map_begin,
+                                             uintptr_t map_end) {
+    for (uint64_t i = 0; i < table->cap; i++) {
+        if (!table->entry[i].used) continue;
+        const uintptr_t ptr = (uintptr_t)table->entry[i].key.ptr;
+        if (ptr >= map_begin && ptr < map_end) return false;
+    }
+    return true;
+}
+
+int ds4_test_vocab_storage_detached(void) {
+    static const char *tokens[] = {
+        "a",
+        "b",
+        "ab",
+        "<\xef\xbd\x9c" "special" "\xef\xbd\x9c>",
+    };
+    static const char *merges[] = { "a b" };
+
+    size_t map_size = 0;
+    for (size_t i = 0; i < sizeof(tokens) / sizeof(tokens[0]); i++) {
+        map_size += sizeof(uint64_t) + strlen(tokens[i]);
+    }
+    for (size_t i = 0; i < sizeof(merges) / sizeof(merges[0]); i++) {
+        map_size += sizeof(uint64_t) + strlen(merges[i]);
+    }
+
+#if defined(MAP_ANONYMOUS)
+    const int map_flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#elif defined(MAP_ANON)
+    const int map_flags = MAP_PRIVATE | MAP_ANON;
+#else
+    return 0;
+#endif
+    uint8_t *mapping = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
+                            map_flags, -1, 0);
+    if (mapping == MAP_FAILED) return 0;
+
+    size_t pos = 0;
+    const uint64_t token_pos = pos;
+    for (size_t i = 0; i < sizeof(tokens) / sizeof(tokens[0]); i++) {
+        pos = ds4_test_write_gguf_string(mapping, pos, tokens[i]);
+    }
+    const uint64_t merge_pos = pos;
+    for (size_t i = 0; i < sizeof(merges) / sizeof(merges[0]); i++) {
+        pos = ds4_test_write_gguf_string(mapping, pos, merges[i]);
+    }
+
+    ds4_model model = {
+        .fd = -1,
+        .map = mapping,
+        .size = pos,
+    };
+    const ds4_array_ref token_array = {
+        .type = GGUF_VALUE_STRING,
+        .len = sizeof(tokens) / sizeof(tokens[0]),
+        .data_pos = token_pos,
+    };
+    const ds4_array_ref merge_array = {
+        .type = GGUF_VALUE_STRING,
+        .len = sizeof(merges) / sizeof(merges[0]),
+        .data_pos = merge_pos,
+    };
+    ds4_vocab vocab = {0};
+    vocab_load_string_storage(&vocab, &model, token_array, merge_array);
+
+    const uintptr_t map_begin = (uintptr_t)mapping;
+    const uintptr_t map_end = map_begin + pos;
+    bool detached = vocab.string_storage != NULL;
+    for (int i = 0; detached && i < vocab.n_vocab; i++) {
+        const uintptr_t ptr = (uintptr_t)vocab.token[i].ptr;
+        detached = ptr < map_begin || ptr >= map_end;
+    }
+    detached = detached &&
+        ds4_test_vocab_keys_are_detached(&vocab.token_to_id,
+                                         map_begin, map_end) &&
+        ds4_test_vocab_keys_are_detached(&vocab.merge_rank,
+                                         map_begin, map_end);
+
+    if (munmap(mapping, map_size) != 0 || !detached) {
+        vocab_free(&vocab);
+        return 0;
+    }
+
+    int token = -1;
+    int rank = -1;
+    bool ok = table_get(&vocab.token_to_id, "ab", 2, &token) &&
+              token == 2 &&
+              table_get(&vocab.merge_rank, "a b", 3, &rank) &&
+              rank == 0 &&
+              vocab.token[2].len == 2 &&
+              memcmp(vocab.token[2].ptr, "ab", 2) == 0;
+
+    ds4_engine *engine = xcalloc(1, sizeof(*engine));
+    engine->vocab = vocab;
+    size_t text_len = 0;
+    char *text = ds4_token_text(engine, 3, &text_len);
+    ok = ok && text_len == vocab.token[3].len &&
+         memcmp(text, vocab.token[3].ptr, text_len) == 0;
+    free(text);
+    free(engine);
+
+    token_vec encoded = {0};
+    bpe_emit_piece(&vocab, (ds4_str){ "ab", 2 }, &encoded);
+    ok = ok && encoded.len == 1 && encoded.v[0] == 2;
+
+    token_vec_free(&encoded);
+    vocab_free(&vocab);
+    return ok ? 1 : 0;
+}
+#endif
 
 char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
     ds4_vocab *vocab = &e->vocab;
@@ -56864,6 +57109,8 @@ typedef struct {
     uint32_t token_start;
     uint32_t token_count;
     uint8_t fingerprint[32];
+    uint8_t state_fingerprint[32];
+    bool state_fingerprint_valid;
 } ds4_vision_identity;
 
 struct ds4_session {
@@ -67952,12 +68199,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
         if (e->vision_ready) {
 #if defined(__APPLE__)
-            e->vision_map_ready = ds4_gpu_set_model_map_range(
+            e->vision_map_ready = ds4_gpu_set_aux_model_map_range(
                     e->vision_model.map,
                     e->vision_model.size,
                     e->vision_model.tensor_data_pos,
-                    e->vision_model.size - e->vision_model.tensor_data_pos,
-                    e->vision_model.max_tensor_bytes) != 0;
+                    e->vision_model.size - e->vision_model.tensor_data_pos) != 0;
 #else
             e->vision_map_ready = ds4_gpu_set_aux_model_map_range(
                     e->vision_model.map,
@@ -67965,10 +68211,15 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     e->vision_model.tensor_data_pos,
                     e->vision_model.size - e->vision_model.tensor_data_pos) != 0;
 #endif
+            if (e->vision_map_ready) {
+                e->vision_map_generation = ds4_gpu_model_views_generation();
+            }
             if (!e->vision_map_ready) {
                 fprintf(stderr,
-                        "ds4: %s failed to map the GLM-5.3 vision encoder\n",
-                        ds4_backend_name(e->backend));
+                        "ds4: %s failed to map the %s vision encoder\n",
+                        ds4_backend_name(e->backend),
+                        e->vision_kind == DS4_VISION_DEEPSEEK4 ?
+                        "DeepSeek" : "GLM-5.3");
                 ds4_engine_close(e);
                 *out = NULL;
                 return 1;
@@ -68302,6 +68553,9 @@ static int ds4_prompt_append_deepseek4_vision(
     free(embedding->data);
     embedding->data = block;
     embedding->token_count = layout.token_count;
+    memset(embedding->state_fingerprint, 0,
+           sizeof(embedding->state_fingerprint));
+    embedding->state_fingerprint_valid = false;
     embedding->layout = 0;
     embedding->grid_width = 0;
     embedding->grid_height = 0;
@@ -68444,9 +68698,15 @@ int ds4_chat_append_multimodal_message(
 
     const int old_len = tokens->len;
     ds4_vocab *vocab = &e->vocab;
+    const bool glm_family = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
     if (tool) {
-        if (vocab->observation_id >= 0) token_vec_push(tokens, vocab->observation_id);
-        tokenize_rendered_chat_vocab(vocab, "<tool_response>", tokens);
+        if (glm_family) {
+            if (vocab->observation_id >= 0) token_vec_push(tokens, vocab->observation_id);
+            tokenize_rendered_chat_vocab(vocab, "<tool_response>", tokens);
+        } else {
+            token_vec_push(tokens, vocab->user_id);
+            bpe_tokenize_text(vocab, "<tool_result>", tokens);
+        }
     } else {
         token_vec_push(tokens, vocab->user_id);
     }
@@ -68454,10 +68714,13 @@ int ds4_chat_append_multimodal_message(
     size_t moved = 0;
     for (size_t i = 0; i <= image_count; i++) {
         const char *text = text_parts[i] ? text_parts[i] : "";
-        if (tool)
-            bpe_tokenize_tool_response_text(vocab, text, tokens);
-        else
+        if (!tool) {
             bpe_tokenize_text(vocab, text, tokens);
+        } else if (glm_family) {
+            bpe_tokenize_tool_response_text(vocab, text, tokens);
+        } else {
+            bpe_tokenize_tool_result_text(vocab, text, tokens);
+        }
         if (i == image_count) break;
         if (!ds4_prompt_append_vision(e, tokens, &spans[i], &embeddings[i],
                                       error, error_cap)) {
@@ -68470,8 +68733,10 @@ int ds4_chat_append_multimodal_message(
         }
         moved++;
     }
-    if (tool)
-        tokenize_rendered_chat_vocab(vocab, "</tool_response>", tokens);
+    if (tool && glm_family)
+        tokenize_rendered_chat_vocab(vocab, "&lt;/tool_response>", tokens);
+    else if (tool)
+        bpe_tokenize_text(vocab, "</tool_result>", tokens);
     return 1;
 }
 
@@ -68490,14 +68755,15 @@ static int ds4_engine_vision_encode_image(
     if (!e->metal_ready) {
         e->metal_ready = ds4_gpu_init() != 0;
     }
-    if (e->metal_ready && !e->vision_map_ready) {
+    if (e->metal_ready &&
+        (!e->vision_map_ready ||
+         e->vision_map_generation != ds4_gpu_model_views_generation())) {
 #if defined(__APPLE__)
-        e->vision_map_ready = ds4_gpu_set_model_map_range(
+        e->vision_map_ready = ds4_gpu_set_aux_model_map_range(
                 e->vision_model.map,
                 e->vision_model.size,
                 e->vision_model.tensor_data_pos,
-                e->vision_model.size - e->vision_model.tensor_data_pos,
-                e->vision_model.max_tensor_bytes) != 0;
+                e->vision_model.size - e->vision_model.tensor_data_pos) != 0;
 #else
         e->vision_map_ready = ds4_gpu_set_aux_model_map_range(
                 e->vision_model.map,
@@ -68505,6 +68771,9 @@ static int ds4_engine_vision_encode_image(
                 e->vision_model.tensor_data_pos,
                 e->vision_model.size - e->vision_model.tensor_data_pos) != 0;
 #endif
+        if (e->vision_map_ready) {
+            e->vision_map_generation = ds4_gpu_model_views_generation();
+        }
     }
     if (!e->metal_ready || !e->vision_map_ready) {
         if (error && error_cap) {
@@ -70807,7 +71076,33 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
  *
  * A non-matching prompt discards the checkpoint and prefills from token zero.
  */
-static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
+static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt,
+                                     char *err, size_t errlen,
+                                     int *retained_tokens);
+
+static int ds4_session_sync_preflight(ds4_session *s,
+                                      const ds4_tokens *prompt,
+                                      char *err, size_t errlen) {
+    if (!s || !prompt) {
+        snprintf(err, errlen, "missing session or prompt");
+        return 1;
+    }
+    if (prompt->len <= 0) {
+        snprintf(err, errlen, "empty prompt");
+        return 1;
+    }
+    if (prompt->len >= s->ctx_size) {
+        snprintf(err, errlen,
+                 "prompt length %d exceeds context %d (one token of generation room is required)",
+                 prompt->len, s->ctx_size);
+        return 1;
+    }
+    if (ds4_session_cancelled(s)) {
+        snprintf(err, errlen, "interrupted");
+        return DS4_SESSION_SYNC_INTERRUPTED;
+    }
+    return 0;
+}
 
 bool ds4_session_vision_prefix_matches(
         const ds4_session     *s,
@@ -70858,6 +71153,60 @@ bool ds4_session_has_vision_state(const ds4_session *s) {
     return s && (s->checkpoint_image_count != 0 || s->sync_image_count != 0);
 }
 
+size_t ds4_session_vision_identity_count(const ds4_session *s) {
+    return s ? s->checkpoint_image_count : 0;
+}
+
+bool ds4_session_vision_identity(const ds4_session *s, size_t index,
+                                 uint32_t *token_start,
+                                 uint32_t *token_count,
+                                 uint8_t state_fingerprint[32]) {
+    if (!s || index >= s->checkpoint_image_count) return false;
+    const ds4_vision_identity *image = &s->checkpoint_images[index];
+    if (!image->state_fingerprint_valid) return false;
+    if (token_start) *token_start = image->token_start;
+    if (token_count) *token_count = image->token_count;
+    if (state_fingerprint)
+        memcpy(state_fingerprint, image->state_fingerprint, 32);
+    return true;
+}
+
+bool ds4_session_restore_vision_identities(ds4_session *s,
+                                           const ds4_vision_span *images,
+                                           size_t image_count) {
+    if (!s || !s->checkpoint_valid || image_count == 0 || !images) return false;
+    if (image_count > SIZE_MAX / sizeof(s->checkpoint_images[0])) return false;
+
+    uint64_t previous_end = 0;
+    for (size_t i = 0; i < image_count; i++) {
+        const uint64_t start = images[i].token_start;
+        const uint64_t count = images[i].embedding.token_count;
+        const uint64_t end = start + count;
+        if (!images[i].embedding.state_fingerprint_valid || count == 0 ||
+            start < previous_end || end > (uint64_t)s->checkpoint.len)
+            return false;
+        previous_end = end;
+    }
+
+    ds4_vision_identity *copy = calloc(image_count, sizeof(copy[0]));
+    if (!copy) return false;
+    for (size_t i = 0; i < image_count; i++) {
+        copy[i].token_start = images[i].token_start;
+        copy[i].token_count = images[i].embedding.token_count;
+        memcpy(copy[i].fingerprint, images[i].embedding.fingerprint,
+               sizeof(copy[i].fingerprint));
+        memcpy(copy[i].state_fingerprint,
+               images[i].embedding.state_fingerprint,
+               sizeof(copy[i].state_fingerprint));
+        copy[i].state_fingerprint_valid =
+            images[i].embedding.state_fingerprint_valid;
+    }
+    free(s->checkpoint_images);
+    s->checkpoint_images = copy;
+    s->checkpoint_image_count = image_count;
+    return true;
+}
+
 static bool ds4_session_vision_range_overlaps(
         const ds4_session *s,
         uint32_t           token_start,
@@ -70873,18 +71222,49 @@ static bool ds4_session_vision_range_overlaps(
     return false;
 }
 
-static bool ds4_session_store_vision_identities(ds4_session *s) {
+/* retained_tokens describes the prefix the backend actually kept, not merely
+ * a token match observed before sync. -1 means that sync cannot attest its
+ * image-state provenance (for example, a distributed recovery). */
+static bool ds4_session_store_vision_identities(ds4_session *s,
+                                                int retained_tokens) {
     ds4_vision_identity *copy = NULL;
     if (s->sync_image_count != 0) {
         if (s->sync_image_count > SIZE_MAX / sizeof(copy[0])) return false;
         copy = calloc(s->sync_image_count, sizeof(copy[0]));
         if (!copy) return false;
         for (size_t i = 0; i < s->sync_image_count; i++) {
-            copy[i].token_start = s->sync_images[i].token_start;
-            copy[i].token_count = s->sync_images[i].embedding.token_count;
+            const ds4_vision_span *current = &s->sync_images[i];
+            copy[i].token_start = current->token_start;
+            copy[i].token_count = current->embedding.token_count;
             memcpy(copy[i].fingerprint,
-                   s->sync_images[i].embedding.fingerprint,
+                   current->embedding.fingerprint,
                    sizeof(copy[i].fingerprint));
+            const uint64_t end = (uint64_t)copy[i].token_start +
+                                 copy[i].token_count;
+            if (retained_tokens >= 0 && end <= (uint64_t)retained_tokens &&
+                i < s->checkpoint_image_count) {
+                /* Retained KV still belongs to the old conditioning vectors,
+                 * even if this request carries newly encoded vectors/hash. */
+                const ds4_vision_identity *previous =
+                    &s->checkpoint_images[i];
+                if (previous->token_start == copy[i].token_start &&
+                    previous->token_count == copy[i].token_count &&
+                    previous->state_fingerprint_valid &&
+                    memcmp(previous->fingerprint, copy[i].fingerprint,
+                           sizeof(copy[i].fingerprint)) == 0) {
+                    memcpy(copy[i].state_fingerprint,
+                           previous->state_fingerprint,
+                           sizeof(copy[i].state_fingerprint));
+                    copy[i].state_fingerprint_valid = true;
+                }
+            } else if (retained_tokens >= 0 &&
+                       copy[i].token_start >= (uint32_t)retained_tokens &&
+                       current->embedding.state_fingerprint_valid) {
+                memcpy(copy[i].state_fingerprint,
+                       current->embedding.state_fingerprint,
+                       sizeof(copy[i].state_fingerprint));
+                copy[i].state_fingerprint_valid = true;
+            }
         }
     }
     free(s->checkpoint_images);
@@ -70898,11 +71278,17 @@ static bool ds4_session_store_vision_identities(ds4_session *s) {
  * graph sequence and the per-layer gates pair up.  The worker acks a sync
  * once its matching prefill completes, surfacing worker-side failures
  * here instead of as a gate timeout mid-decode. */
-int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+static int ds4_session_sync_impl(ds4_session *s, const ds4_tokens *prompt,
+                                 char *err, size_t errlen,
+                                 bool *backend_started) {
+    if (backend_started) *backend_started = false;
+    int preflight = ds4_session_sync_preflight(s, prompt, err, errlen);
+    if (preflight != 0) return preflight;
     if (s && s->checkpoint_valid && !ds4_session_vision_prefix_matches(
                      s, s->sync_images, s->sync_image_count)) {
         ds4_session_invalidate(s);
     }
+    if (backend_started) *backend_started = true;
 #ifndef DS4_NO_GPU
     ds4_session_dspark_scheduler_begin_request(s);
 #endif
@@ -70924,7 +71310,9 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             return 1;
         }
     }
-    int rc = ds4_session_sync_internal(s, prompt, err, errlen);
+    int retained_tokens = 0;
+    int rc = ds4_session_sync_internal(s, prompt, err, errlen,
+                                       &retained_tokens);
 #ifndef DS4_NO_GPU
     if (rc == 0) glm_debug_dump_prefill_logits(s->logits);
     if (rc == 0) {
@@ -70970,13 +71358,244 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             return rc != 0 ? rc : 1;
         }
     }
-    if (rc == 0 && !ds4_session_store_vision_identities(s)) {
+    if (rc == 0 && !ds4_session_store_vision_identities(s, retained_tokens)) {
         ds4_session_invalidate(s);
         snprintf(err, errlen, "unable to retain image prompt identity");
         return 1;
     }
     return rc;
 }
+
+int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt,
+                     char *err, size_t errlen) {
+    return ds4_session_sync_impl(s, prompt, err, errlen, NULL);
+}
+
+static int ds4_session_finish_multimodal_sync(ds4_session *s, int rc,
+                                              bool backend_started) {
+    /* A failed image sync may have advanced the token checkpoint at a safe
+     * prefill boundary, but ds4_session_sync() publishes image identities only
+     * after the whole sync succeeds.  Do not leave that image-conditioned KV
+     * frontier available for later eviction or reuse without an exact key. */
+    if (rc != 0 && backend_started && s &&
+        (s->checkpoint_valid || s->checkpoint_image_count != 0)) {
+        ds4_session_invalidate(s);
+    }
+    if (s) {
+        s->sync_images = NULL;
+        s->sync_image_count = 0;
+    }
+    return rc;
+}
+
+#ifndef DS4_NO_GPU
+static bool ds4_test_cancel_always(void *ud) {
+    (void)ud;
+    return true;
+}
+
+bool ds4_test_multimodal_sync_finish_policy(void) {
+    ds4_engine engine = {0};
+    engine.backend = DS4_BACKEND_CPU;
+
+    for (size_t retained = 0; retained <= 1; retained++) {
+        ds4_session session = {0};
+        ds4_vision_span images[2] = {0};
+        session.engine = &engine;
+        session.checkpoint_valid = true;
+        token_vec_push(&session.checkpoint, 7);
+        if (retained != 0) {
+            session.checkpoint_images = calloc(1, sizeof(session.checkpoint_images[0]));
+            if (!session.checkpoint_images) {
+                token_vec_free(&session.checkpoint);
+                return false;
+            }
+            session.checkpoint_image_count = 1;
+        }
+        session.sync_images = images;
+        session.sync_image_count = retained + 1;
+
+        int rc = ds4_session_finish_multimodal_sync(
+            &session, DS4_SESSION_SYNC_INTERRUPTED, true);
+        bool invalidated = rc == DS4_SESSION_SYNC_INTERRUPTED &&
+                           !session.checkpoint_valid &&
+                           session.checkpoint.len == 0 &&
+                           !session.checkpoint_images &&
+                           session.checkpoint_image_count == 0 &&
+                           !session.sync_images &&
+                           session.sync_image_count == 0;
+        token_vec_free(&session.checkpoint);
+        free(session.checkpoint_images);
+        if (!invalidated) return false;
+    }
+
+    ds4_session completed = {0};
+    ds4_vision_span image = {0};
+    completed.engine = &engine;
+    completed.checkpoint_valid = true;
+    token_vec_push(&completed.checkpoint, 11);
+    completed.checkpoint_images = calloc(1, sizeof(completed.checkpoint_images[0]));
+    if (!completed.checkpoint_images) {
+        token_vec_free(&completed.checkpoint);
+        return false;
+    }
+    completed.checkpoint_image_count = 1;
+    completed.sync_images = &image;
+    completed.sync_image_count = 1;
+    int rc = ds4_session_finish_multimodal_sync(&completed, 0, true);
+    bool preserved = rc == 0 && completed.checkpoint_valid &&
+                     completed.checkpoint.len == 1 &&
+                     completed.checkpoint_image_count == 1 &&
+                     !completed.sync_images &&
+                     completed.sync_image_count == 0;
+    token_vec_free(&completed.checkpoint);
+    free(completed.checkpoint_images);
+    if (!preserved) return false;
+
+    ds4_session rejected = {0};
+    ds4_vision_span rejected_image = {0};
+    int rejected_token = 42;
+    ds4_tokens rejected_prompt = {
+        .v = &rejected_token,
+        .len = 1,
+        .cap = 1,
+    };
+    engine.vision_ready = true;
+    engine.vision_image_token = rejected_token;
+    rejected.engine = &engine;
+    rejected.ctx_size = 1;
+    rejected.checkpoint_valid = true;
+    token_vec_push(&rejected.checkpoint, 17);
+    rejected.checkpoint_images = calloc(1, sizeof(rejected.checkpoint_images[0]));
+    if (!rejected.checkpoint_images) {
+        token_vec_free(&rejected.checkpoint);
+        return false;
+    }
+    rejected.checkpoint_image_count = 1;
+    rejected_image.embedding.data = (float *)&rejected_token;
+    rejected_image.embedding.token_count = 1;
+    char err[80] = {0};
+    rc = ds4_session_sync_multimodal(&rejected, &rejected_prompt,
+                                     &rejected_image, 1,
+                                     err, sizeof(err));
+    preserved = rc != 0 && rejected.checkpoint_valid &&
+                rejected.checkpoint.len == 1 &&
+                rejected.checkpoint_image_count == 1;
+    if (preserved) {
+        rejected.ctx_size = 2;
+        rejected.cancel = ds4_test_cancel_always;
+        rc = ds4_session_sync_multimodal(&rejected, &rejected_prompt,
+                                         &rejected_image, 1,
+                                         err, sizeof(err));
+        preserved = rc == DS4_SESSION_SYNC_INTERRUPTED &&
+                    rejected.checkpoint_valid &&
+                    rejected.checkpoint.len == 1 &&
+                    rejected.checkpoint_image_count == 1;
+    }
+    token_vec_free(&rejected.checkpoint);
+    free(rejected.checkpoint_images);
+    return preserved;
+}
+
+bool ds4_test_vision_identity_carries_exact_state_fingerprint(void) {
+    ds4_session session = {0};
+    ds4_vision_span current = {0};
+    session.checkpoint_images = calloc(1, sizeof(session.checkpoint_images[0]));
+    if (!session.checkpoint_images) return false;
+    session.checkpoint_image_count = 1;
+    session.checkpoint_images[0].token_start = 64;
+    session.checkpoint_images[0].token_count = 8;
+    memset(session.checkpoint_images[0].fingerprint, 0x31,
+           sizeof(session.checkpoint_images[0].fingerprint));
+    memset(session.checkpoint_images[0].state_fingerprint, 0xa7,
+           sizeof(session.checkpoint_images[0].state_fingerprint));
+    session.checkpoint_images[0].state_fingerprint_valid = true;
+
+    current.token_start = 64;
+    current.embedding.token_count = 8;
+    memset(current.embedding.fingerprint, 0x31,
+           sizeof(current.embedding.fingerprint));
+    current.embedding.state_fingerprint_valid = false;
+    session.sync_images = &current;
+    session.sync_image_count = 1;
+    if (!ds4_session_store_vision_identities(&session, 72)) {
+        free(session.checkpoint_images);
+        return false;
+    }
+    bool preserved = session.checkpoint_image_count == 1 &&
+                     session.checkpoint_images[0].state_fingerprint_valid;
+    for (size_t i = 0; preserved &&
+                       i < sizeof(session.checkpoint_images[0].state_fingerprint);
+         i++) {
+        preserved = session.checkpoint_images[0].state_fingerprint[i] == 0xa7;
+    }
+
+    /* A changed image must never inherit the old conditioning hash. */
+    current.embedding.fingerprint[0] ^= 0xff;
+    current.embedding.state_fingerprint_valid = false;
+    if (!ds4_session_store_vision_identities(&session, 72)) preserved = false;
+    const bool changed_rejected = session.checkpoint_image_count == 1 &&
+        !session.checkpoint_images[0].state_fingerprint_valid;
+    free(session.checkpoint_images);
+    return preserved && changed_rejected;
+}
+
+bool ds4_test_vision_identity_keeps_retained_hash(void) {
+    const struct {
+        int retained;
+        bool previous_valid, current_valid, changed_source, expected_valid;
+        uint8_t expected_hash;
+    } cases[] = {
+        {80, true,  true,  false, true,  0xa7}, /* new hash must not relabel old KV */
+        {72, true,  false, false, true,  0xa7}, /* exact image-end boundary */
+        { 0, true,  true,  false, true,  0xb8}, /* full rebuild uses new vectors */
+        { 0, true,  false, false, false, 0},    /* rebuild cannot inherit old hash */
+        {64, true,  true,  false, true,  0xb8}, /* image starts at recompute boundary */
+        {68, true,  true,  false, false, 0},    /* mixed old/new image rows */
+        {-1, true,  true,  false, false, 0},    /* backend cannot attest provenance */
+        {80, false, true,  false, false, 0},    /* unknown old vectors stay unknown */
+        {80, true,  true,  true,  false, 0},    /* no matching retained identity */
+    };
+    for (size_t n = 0; n < sizeof(cases) / sizeof(cases[0]); n++) {
+        ds4_session session = {0};
+        ds4_vision_span current[2] = {0};
+        session.checkpoint_images = calloc(1, sizeof(session.checkpoint_images[0]));
+        if (!session.checkpoint_images) return false;
+        session.checkpoint_image_count = 1;
+        session.checkpoint_images[0].token_start = 64;
+        session.checkpoint_images[0].token_count = 8;
+        memset(session.checkpoint_images[0].fingerprint, 0x31, 32);
+        memset(session.checkpoint_images[0].state_fingerprint, 0xa7, 32);
+        session.checkpoint_images[0].state_fingerprint_valid = cases[n].previous_valid;
+        current[0].token_start = 64;
+        current[0].embedding.token_count = 8;
+        memset(current[0].embedding.fingerprint,
+               cases[n].changed_source ? 0x32 : 0x31, 32);
+        memset(current[0].embedding.state_fingerprint, 0xb8, 32);
+        current[0].embedding.state_fingerprint_valid = cases[n].current_valid;
+        /* An appended image is newly computed, independently of the old one. */
+        current[1].token_start = 96;
+        current[1].embedding.token_count = 8;
+        memset(current[1].embedding.state_fingerprint, 0xc9, 32);
+        current[1].embedding.state_fingerprint_valid = true;
+        session.sync_images = current;
+        session.sync_image_count = 2;
+        bool ok = ds4_session_store_vision_identities(&session, cases[n].retained);
+        ok = ok && session.checkpoint_image_count == 2 &&
+             session.checkpoint_images[0].state_fingerprint_valid == cases[n].expected_valid &&
+             session.checkpoint_images[1].state_fingerprint_valid == (cases[n].retained >= 0);
+        for (size_t i = 0; ok && i < 32; i++) {
+            if (cases[n].expected_valid)
+                ok = session.checkpoint_images[0].state_fingerprint[i] == cases[n].expected_hash;
+            if (cases[n].retained >= 0)
+                ok = ok && session.checkpoint_images[1].state_fingerprint[i] == 0xc9;
+        }
+        free(session.checkpoint_images);
+        if (!ok) return false;
+    }
+    return true;
+}
+#endif
 
 int ds4_session_sync_multimodal(
         ds4_session *s,
@@ -71032,36 +71651,24 @@ int ds4_session_sync_multimodal(
     s->graph.prefill_vision_spans = images;
     s->graph.prefill_vision_span_count = image_count;
 #endif
-    const int rc = ds4_session_sync(s, prompt, err, errlen);
+    bool backend_started = false;
+    const int rc = ds4_session_sync_impl(s, prompt, err, errlen,
+                                         &backend_started);
 #ifndef DS4_NO_GPU
     s->graph.prefill_vision_spans = NULL;
     s->graph.prefill_vision_span_count = 0;
 #endif
-    s->sync_images = NULL;
-    s->sync_image_count = 0;
-    return rc;
+    return ds4_session_finish_multimodal_sync(s, rc, backend_started);
 }
 
-static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
-    if (!s || !prompt) {
-        snprintf(err, errlen, "missing session or prompt");
-        return 1;
-    }
-    if (prompt->len <= 0) {
-        snprintf(err, errlen, "empty prompt");
-        return 1;
-    }
-    if (prompt->len >= s->ctx_size) {
-        snprintf(err, errlen,
-                 "prompt length %d exceeds context %d (one token of generation room is required)",
-                 prompt->len, s->ctx_size);
-        return 1;
-    }
-    if (ds4_session_cancelled(s)) {
-        snprintf(err, errlen, "interrupted");
-        return DS4_SESSION_SYNC_INTERRUPTED;
-    }
+static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt,
+                                     char *err, size_t errlen,
+                                     int *retained_tokens) {
+    *retained_tokens = 0;
     if (s->distributed) {
+        /* The coordinator may recover by replaying after a suffix failure;
+         * its current interface does not report which image rows survived. */
+        *retained_tokens = -1;
         const ds4_tokens *checkpoint = s->checkpoint_valid ? &s->checkpoint : NULL;
         return ds4_dist_session_sync(s->distributed,
                                      s,
@@ -71129,6 +71736,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             prompt->len >= s->checkpoint.len &&
             ds4_tokens_starts_with(prompt, &s->checkpoint))
         {
+            *retained_tokens = s->checkpoint.len;
             s->mtp_draft_valid = false;
             for (int i = s->checkpoint.len; i < prompt->len; i++) {
                 if (ds4_session_cancelled(s)) {
@@ -71217,6 +71825,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             ds4_tokens_starts_with(prompt, &s->checkpoint))
         {
             start = s->checkpoint.len;
+            *retained_tokens = start;
             resumed_checkpoint = true;
             s->mtp_draft_valid = false;
         } else {
@@ -71451,6 +72060,9 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             s->glm_graph.full_kv_cache &&
             s->glm_dense_cache_len < s->glm_graph.ctx_cap)
         {
+            /* This repairs only a dense window alongside retained compact
+             * state. A single retained-prefix boundary cannot describe it. */
+            *retained_tokens = -1;
             const uint32_t dense_end =
                 (uint32_t)prompt->len < s->glm_graph.ctx_cap ?
                     (uint32_t)prompt->len :
@@ -71555,6 +72167,11 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             (uint32_t)suffix >= resume_min &&
             indexed_batch_available)
         {
+            /* A dense-cache gap is not a lost compact prefix. Indexed prefill
+             * reads layer_kv_lora_cache/layer_k_rope_cache and writes only from
+             * start onward. The decode-resume branch below uses the same
+             * compact caches when dense KV lags. Both retain the old image
+             * conditioning; only the dense bridge above reports unknown. */
             for (int i = start; i < prompt->len; ) {
                 if (ds4_session_cancelled(s)) {
                     snprintf(err, errlen, "interrupted");
@@ -71922,6 +72539,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         prompt->len >= s->checkpoint.len &&
         ds4_tokens_starts_with(prompt, &s->checkpoint))
     {
+        *retained_tokens = s->checkpoint.len;
         s->mtp_draft_valid = false;
         const int suffix = prompt->len - s->checkpoint.len;
         const uint32_t resume_min = metal_graph_resume_prefill_min_tokens();

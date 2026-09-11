@@ -1,0 +1,68 @@
+ds4: Metal device Apple M4 Max, 128.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal SSD streaming mode enabled; full model residency and warmup are skipped
+ds4: SSD streaming auto cache budget
+ds4:   metal recommends 115.23 GiB working set
+ds4:   using 80% total for model + cached experts: 92.19 GiB
+ds4:   non-routed weights: 14.49 GiB
+ds4:   routed expert size: 13.50 MiB
+ds4:   expert budget before prefill/full-layer reserve: 5893 (77.69 GiB)
+ds4: GLM SSD streaming full resident layers: 0 (auto selected 0 layers)
+ds4: metal SSD streaming cache target 77.69 GiB; effective 77.69 GiB = 7.59 GiB prefill headroom + 70.10 GiB dynamic cache (5317 experts, 13.50 MiB each)
+ds4: GLM SSD streaming decode map: global 14.49 GiB (10.41 GiB beyond the active layer window)
+ds4: Metal SSD static weights locked 14.49 GiB; pageable 0.00 GiB
+ds4: SSD streaming initial metal model map restricted to token embedding (1 spans, 1.18 GiB tensor span)
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 0.05 GiB (raw 0.00 + compressed 0.05) + buffers 2.92 GiB + resident model 14.49 GiB + expert cache 70.10 GiB + prefill expert reserve 7.59 GiB = 95.15 GiB planned
+ds4: memory detail: ctx=4096 prefill_cap=2048 raw_kv_rows=0 compressed_kv_rows=4096 backend=metal
+0908 13:35:02 ds4-server: context buffers 3039.16 MiB (ctx=4096, backend=metal, prefill_chunk=2048, raw_kv_rows=0, compressed_kv_rows=4096)
+ds4: GLM SSD streaming decode map: global 14.49 GiB (0.22 GiB beyond the active layer window)
+ds4: GLM graph using compact DSA KV only; expanded full-attention KV cache is skipped
+ds4: GLM graph allocating compact DSA cache: rows=4096 logical_ctx=4096 kv_layers=45 indexer_layers=11 f16 0.05 GiB
+ds4: GLM compact indexed prefill chunk=2048 score_rows=2048 score_scratch=8.00 MiB
+0908 13:35:02 ds4-server: KV disk cache /Users/michaelkuebbeler/.ds4/glm53-warmup/2026-09-08-compare/kv-b (budget=32768 MiB, cross-quant=accept, min=512, cold_max=30000, continued=10000, trim=32, align=2048, hit_half_life=21600s)
+0908 13:35:02 ds4-server: listening on http://0.0.0.0:8008
+0908 13:35:27 ds4-server: chat ctx=0..115:115 prompt start
+0908 13:35:54 ds4-server: chat ctx=0..115:115 prefill chunk 115/115 (100.0%) chunk=0.00 t/s avg=4.15 t/s 27.678s
+0908 13:35:54 ds4-server: chat ctx=0..115:115 prompt done 27.680s
+0908 13:36:03 ds4-server: chat ctx=115..165:50 gen=50 decoding chunk=5.72 t/s avg=5.72 t/s 8.740s
+0908 13:36:12 ds4-server: chat ctx=165..215:50 gen=100 decoding chunk=5.34 t/s avg=5.53 t/s 18.098s
+0908 13:36:21 ds4-server: chat ctx=215..265:50 gen=150 decoding chunk=5.55 t/s avg=5.53 t/s 27.110s
+0908 13:36:30 ds4-server: chat ctx=265..315:50 gen=200 decoding chunk=5.64 t/s avg=5.56 t/s 35.979s
+0908 13:36:40 ds4-server: chat ctx=315..365:50 gen=250 decoding chunk=5.11 t/s avg=5.46 t/s 45.754s
+0908 13:36:48 ds4-server: chat ctx=365..415:50 gen=300 decoding chunk=6.20 t/s avg=5.57 t/s 53.813s
+0908 13:36:58 ds4-server: chat ctx=415..465:50 gen=350 decoding chunk=5.08 t/s avg=5.50 t/s 63.660s
+0908 13:37:06 ds4-server: chat ctx=465..515:50 gen=400 decoding chunk=6.05 t/s avg=5.56 t/s 71.919s
+0908 13:37:12 ds4-server: chat ctx=515..565:50 gen=450 decoding chunk=8.44 t/s avg=5.78 t/s 77.841s
+0908 13:37:20 ds4-server: chat ctx=565..615:50 gen=500 decoding chunk=6.05 t/s avg=5.81 t/s 86.107s
+0908 13:37:29 ds4-server: chat ctx=615..665:50 gen=550 decoding chunk=5.53 t/s avg=5.78 t/s 95.145s
+0908 13:37:39 ds4-server: chat ctx=665..715:50 gen=600 decoding chunk=5.29 t/s avg=5.74 t/s 104.590s
+0908 13:37:48 ds4-server: chat ctx=715..765:50 gen=650 decoding chunk=5.49 t/s avg=5.72 t/s 113.696s
+0908 13:37:57 ds4-server: chat ctx=765..815:50 gen=700 decoding chunk=5.43 t/s avg=5.70 t/s 122.899s
+0908 13:38:06 ds4-server: chat ctx=815..865:50 gen=750 decoding chunk=5.50 t/s avg=5.68 t/s 131.992s
+0908 13:38:14 ds4-server: chat ctx=865..915:50 gen=800 decoding chunk=6.13 t/s avg=5.71 t/s 140.142s
+0908 13:38:22 ds4-server: chat ctx=915..965:50 gen=850 decoding chunk=6.74 t/s avg=5.76 t/s 147.563s
+0908 13:38:31 ds4-server: chat ctx=965..1015:50 gen=900 decoding chunk=5.55 t/s avg=5.75 t/s 156.575s
+0908 13:38:39 ds4-server: chat ctx=1015..1065:50 gen=950 decoding chunk=6.40 t/s avg=5.78 t/s 164.382s
+0908 13:38:47 ds4-server: chat ctx=1065..1115:50 gen=1000 decoding chunk=6.35 t/s avg=5.81 t/s 172.257s
+0908 13:38:53 ds4-server: chat ctx=1115..1165:50 gen=1050 decoding chunk=7.57 t/s avg=5.87 t/s 178.859s
+0908 13:39:02 ds4-server: chat ctx=1165..1215:50 gen=1100 decoding chunk=5.41 t/s avg=5.85 t/s 188.106s
+0908 13:39:12 ds4-server: chat ctx=1215..1265:50 gen=1150 decoding chunk=5.03 t/s avg=5.81 t/s 198.054s
+0908 13:39:20 ds4-server: chat ctx=1265..1315:50 gen=1200 decoding chunk=6.51 t/s avg=5.83 t/s 205.737s
+0908 13:39:28 ds4-server: chat ctx=1315..1365:50 gen=1250 decoding chunk=6.67 t/s avg=5.86 t/s 213.235s
+0908 13:39:37 ds4-server: chat ctx=1365..1415:50 gen=1300 decoding chunk=5.38 t/s avg=5.84 t/s 222.526s
+0908 13:39:45 ds4-server: chat ctx=1415..1465:50 gen=1350 decoding chunk=6.30 t/s avg=5.86 t/s 230.460s
+0908 13:39:54 ds4-server: chat ctx=1465..1515:50 gen=1400 decoding chunk=5.71 t/s avg=5.85 t/s 239.222s
+0908 13:40:03 ds4-server: chat ctx=1515..1565:50 gen=1450 decoding chunk=5.49 t/s avg=5.84 t/s 248.324s
+0908 13:40:12 ds4-server: chat ctx=1565..1615:50 gen=1500 decoding chunk=5.43 t/s avg=5.82 t/s 257.526s
+0908 13:40:21 ds4-server: chat ctx=1615..1665:50 gen=1550 decoding chunk=5.65 t/s avg=5.82 t/s 266.381s
+0908 13:40:30 ds4-server: chat ctx=1665..1715:50 gen=1600 decoding chunk=5.46 t/s avg=5.81 t/s 275.532s
+0908 13:40:40 ds4-server: chat ctx=1715..1765:50 gen=1650 decoding chunk=5.16 t/s avg=5.78 t/s 285.225s
+0908 13:40:50 ds4-server: chat ctx=1765..1815:50 gen=1700 decoding chunk=4.68 t/s avg=5.75 t/s 295.900s
+0908 13:40:59 ds4-server: chat ctx=1815..1865:50 gen=1750 decoding chunk=5.78 t/s avg=5.75 t/s 304.552s
+0908 13:41:08 ds4-server: chat ctx=1865..1915:50 gen=1800 decoding chunk=5.30 t/s avg=5.73 t/s 313.993s
+0908 13:41:08 ds4-server: chat ctx=0..115:115 gen=1800 finish=length 341.675s
+0908 13:41:44 ds4-server: shutdown requested, draining requests
+0908 13:41:44 ds4-server: persisting resident KV cache before shutdown slot=0 tokens=1915
+0908 13:41:44 ds4-server: kv cache stored tokens=1915 trimmed=0 reason=shutdown key=token-text size=189.92 MiB save=66.7 ms

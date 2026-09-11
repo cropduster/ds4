@@ -96,7 +96,6 @@ and hardware-specific setups:
 | [Strix Halo / Framework Desktop](docs/STRIX_HALO.md) | `make strix-halo` |
 | [One or more CUDA cards, including Ada/L40S](docs/CUDA_MULTI_GPU.md) | `make cuda-generic` |
 
-For a first run on a 96 or 128 GB machine, download DeepSeek V4 Flash Q2:
 
 ```sh
 ./download_model.sh ds4f-q2
