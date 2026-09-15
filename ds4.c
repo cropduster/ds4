@@ -49190,12 +49190,18 @@ static bool glm_graph_encode_sparse_ffn_one(
             .gate_expert_bytes = gate_out * gate_row_bytes,
             .down_expert_bytes = down_out * down_row_bytes,
         };
+        /*
+         * The asynchronous selected-id load is backend- and quant-agnostic:
+         * it signals a shared event on the router command buffer, waits on it
+         * in a service thread and stages the expert-cache load through the
+         * generic selected-load path, so the decode thread keeps working on
+         * the shared expert meanwhile.  It used to be restricted to the
+         * generic (IQ2) routed layout on Metal, which left every uniform
+         * Q2_K/Q4_K GLM streaming layer on the synchronous host readback of
+         * the router top-k ids, once per layer and token.
+         */
         const bool async_selected_load =
-#ifdef DS4_ROCM_BUILD
             streaming_selected_cache &&
-#else
-            glm_graph_layer_uses_generic_routed_moe(l) &&
-#endif
             glm_graph_use_streaming_selected_async_load(g);
         async_path_profiled = false;
         uint64_t selected_event = 0;
