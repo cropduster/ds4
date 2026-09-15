@@ -23,6 +23,7 @@ Gestartet: 15.09.2026 14:26 · Stand: 15.09.2026 15:05
 | 14:51 | **Lauf D** Feinzerlegung | §9 + Phase 0 | 6,21 t/s, Gates PASS, 584 B identisch |
 | 14:52 | Commit Phase-0-Instrumentierung | `git commit` | 73be92c |
 | 14:53 | **Probe-Matrix** Phase 1 (nicht in §4 ausgeschlossene I/O-Knöpfe) | `/tmp/probe-io.sh` | alle 584 B PASS, Raten siehe REPORT.md §2b |
+| 14:59 | **Falsifikationstest** der I/O-These: GLM-Q2 streaming + resident, gleiches Binary | `/tmp/q2-test.sh` | Q2-Streaming **21,67 t/s**, Q2-resident **28,63 t/s** (Q4: 6,22) — siehe REPORT.md §3e |
 | 15:05 | I/O-/Kostenanalyse + Kandidatenbewertung | `/tmp/io-analyze.py`, `/tmp/tl-analyze.py` | siehe REPORT.md |
 
 ## Phase-0-Kernzahlen (Decode, 127 Token, je Lauf byte-identisch zu 584 B)

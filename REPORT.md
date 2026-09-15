@@ -61,7 +61,9 @@ widerlegt, bevor Code geschrieben wurde.
 Verfahren (neu, env-gated, verhaltensneutral):
 - **GPU-Ausführungszeit**: Metal-Timestamps `cb.GPUStartTime/GPUEndTime` jedes Command Buffers,
   aufsummiert als *Union* der Intervalle (`gpu_busy_union`) und zusätzlich als naive Summe
-  (`gpu_span_sum`) — beide identisch ⇒ keine überlappenden Command Buffer.
+  (`gpu_span_sum`) — beide identisch ⇒ keine überlappenden Command Buffer. Die Spanne umfasst die
+  gesamte GPU-Belegung des Command Buffers (inkl. etwaiger GPU-interner Lücken), ist also eine
+  **Obergrenze** für die reine Kernel-Ausführung.
 - **Host-Wartezeit**: Wandzeit in `waitUntilCompleted`.
 - **Host-Kette des GLM-Routed-MoE**: Sub-Timer für Cache-Peek, Missing-Load, Slot-Install, Tail.
 - **I/O**: Intervalltrace aller Expert-`pread`s (Start/Ende/Bytes).
@@ -102,7 +104,9 @@ Die GPU-Zeit wird also zu ~60 % von den **residenten bf16-Gewichten** verbraucht
 Layer×Token), nicht von den SSD-gestreamten Q4-Experten (0,29 ms je Layer×Token). Der Timeline-Summenwert
 (64 ms/Token) liegt über der CB-Union (49,6 ms); Ursache ist die andere Messquelle
 (Stage-Boundary-Counter-Samples inkl. Intra-Encoder-Lücken, Lauf B war zudem 2,6 % langsamer durch
-das Sampling) — die **Anteile** sind belastbar, die Absolutwerte sind es nicht.
+das Sampling). Der Faktor ist über Prefill (975 vs. 781 ms) und Decode (8123 vs. 6303 ms) mit
+1,25–1,29 nahezu konstant, was auf einen Clock-/Skalierungsunterschied der GPU-Timestamps hindeutet;
+die **Anteile** sind belastbar, die Absolutwerte der Timeline sind es nicht.
 
 ### 3c. I/O-Profil (Trace Lauf C)
 
@@ -142,6 +146,39 @@ anfordern, und die Experten des **nächsten** Layers sind erst nach dessen Route
   13,5 MiB je Experte oder 0,195 ms je `F_RDADVISE`-Range) den Gewinn übersteigen.
 - **Fazit: ≥ 10 t/s ist auf dieser Hardware/Konfiguration mit den Kandidaten aus §6 nicht erreichbar.**
   Der Hebel liegt nicht im Pfad, sondern im Lesevolumen je Token (Hit-Rate, Quantisierung, Modellwahl).
+
+## 3e. Falsifikationstest der I/O-These: GLM-Q2 mit demselben Binary
+
+Weil die MESSREIHE (§7.3) „Q2-Streaming warm" als offenen Vergleichspunkt führt und weil die
+Zentralaussage dieses Berichts (Bytes/Token begrenzen, nicht die Host-Kette) eine Vorhersage macht,
+wurde sie mit demselben Binary und identischen Flags getestet:
+
+| Lauf | Modell | Modus | prefill t/s | decode t/s | Output |
+|---|---|---|---|---|---|
+| Q2-STREAM | `GLM-5.3-Flash-Q2.gguf` (89,9 GiB, uniform Q2_K, Expert 6,75 MiB) | `--ssd-streaming` | 1,45 | **21,67** | 585 B |
+| Q2-RES | dasselbe | resident (`--ctx`, ohne Streaming) | 52,07 | **28,63** | 585 B (identisch) |
+| Q4-REF | `GLM-5.3-Flash-Q4_K.gguf` (177,8 GiB, Expert 13,5 MiB) | `--ssd-streaming` | 2,65 | 6,22 | 584 B |
+
+**Der Test bestätigt die These und widerlegt die Host-Ketten-Erklärung.** Die Host-Kette ist in allen
+Fällen dieselbe (gleiche Binärdatei, gleiche Graph-Struktur, gleiche Per-Layer-Synchronisation);
+variiert wird nur das Datenvolumen bzw. die RAM-Passung. Ergebnis: **3,5× Durchsatz**, obwohl die
+Zahl der Layer×Token-Synchronisationen identisch ist. Wäre der Adress-/Verwaltungspfad der Engpass,
+dürfte Q2 nicht schneller sein als Q4.
+
+Mechanismus (aus den Logs belegt):
+- Q2-Prefill liest das Modell einmal vom Gerät (Prefill 1,45 t/s ≈ 4,5 GiB/s über ~90 GiB), danach
+  passt das 90-GiB-Modell in die 128 GiB RAM → die Generierung läuft aus dem Page-Cache.
+- Q4 (178 GiB) kann **nicht** in RAM passen; deshalb muss jeder Token ~0,52 GiB vom Gerät nachladen
+  (Sektion 3c) — das ist der Kostenblock, der Q4 bei 6,2 t/s hält.
+- Auffällig und offen: beim Q2-Lauf wurde der **Streaming-Expert-Cache nicht befüllt**
+  („streaming experts 0.00 GiB tracked live", keine Cache-Statistikzeile), d. h. Q2 bedient sich
+  über den mmap-/Page-Cache-Pfad. Die Q2-Zahlen sind warm und nicht mit `purge` (Admin) verifiziert.
+- Q2-resident 28,63 t/s weicht von der MESSREIHE-Referenz (17,96 t/s) ab; plausibel durch
+  Page-Cache-Wärme und den in dieser Session freien Speicher (kein konkurrierender Server).
+
+**Konsequenz:** Der Hebel ist die RAM-Passung bzw. das Lesevolumen je Token — genau die Aussage, die
+die MESSPLAN-POTENZIALE bereits als „größerer Hebel außerhalb des Pfads" notiert. Ein Host-Pfad-Umbau
+kann daran nichts ändern.
 
 ## 4. Diffs und Build
 
@@ -200,9 +237,15 @@ verschiedene Eingriffe in den Lade-/Nebenläufigkeitspfad Abweichungen von ±3 %
 Baseline über drei Läufe auf ±0,3 % reproduzierbar war; auf eine n=2-Serie wurde verzichtet, weil
 alle Effekte ≤3 % (also ≤ 0,2 t/s) und damit unterhalb jeder Relevanzschwelle lagen.
 
-**Nicht abgewichen:** Messprotokoll §9, 128-Token-Falle (§8 Regel 4, je Lauf `cache aging tokens=127`
-und `selected_calls=5334=42×127`), Byte-Gate `cmp` gegen `/tmp/ds4-g0-q4-kalt.out` (584 B) in **allen**
-11 Läufen PASS, eine Variable je Lauf, kein `--mtp`, Logs nach `/tmp/ds4-*.err`.
+**Abweichung 4 — zwei zusätzliche Läufe mit GLM-Q2 (nicht im Auftrag vorgesehen).** Sie dienen als
+Falsifikationstest der eigenen Schlussfolgerung (§3e). Sie berühren weder Q4-Messungen noch den
+Byte-Gate (andere Modellgewichte ⇒ anderer Output, 585 B statt 584 B); beide Q2-Läufe sind untereinander
+byte-identisch. Q2-resident belegt dabei 89,87 GiB residenten Modellspeicher — der Praxistest der
+RAM-Passungs-These.
+
+**Nicht abgewichen:** Messprotokoll §9, 128-Token-Falle (§8 Regel 4, je Q4-Lauf `cache aging tokens=127`
+und `selected_calls=5334=42×127`), Byte-Gate `cmp` gegen `/tmp/ds4-g0-q4-kalt.out` (584 B) in **allen
+11 Q4-Läufen** PASS, eine Variable je Lauf, kein `--mtp`, Logs nach `/tmp/ds4-*.err`.
 
 ## 6. Offene Punkte und empfohlene nächste Schritte
 
@@ -210,19 +253,29 @@ und `selected_calls=5334=42×127`), Byte-Gate `cmp` gegen `/tmp/ds4-g0-q4-kalt.o
    Phase 0 mit negativer Machbarkeitsprüfung; Phase 1/2 wurden deshalb nicht umgesetzt (nicht: nicht
    geschafft — bewusst verworfen, siehe §5).
 2. **Der einzige gemessen große Hebel liegt außerhalb des Pfads**: das **Lesevolumen je Token**.
-   0,52 GiB/Token bei hit_rate 0,827. Optionen mit belastbarer Datenlage: GLM-Q2 resident 17,96 t/s
-   (MESSREIHE §5), DeepSeek-MXFP4-Streaming 15,56 t/s; höhere Cache-Budgets sind bereits widerlegt
+   0,52 GiB/Token bei hit_rate 0,827. Der Q2-Test (§3e) quantifiziert das: dasselbe Binary, dieselbe
+   Host-Kette, nur 90 statt 178 GiB Modell ⇒ **21,67 t/s streaming / 28,63 t/s resident** statt 6,22 t/s.
+   Optionen mit belastbarer Datenlage: GLM-Q2 (resident 28,6 t/s bzw. streaming 21,7 t/s in dieser
+   Session), DeepSeek-MXFP4-Streaming 15,56 t/s; höhere Cache-Budgets für Q4 sind bereits widerlegt
    (48/56/85 GB schlechter).
-3. **Upstream-Einordnung:** Der Issue-Entwurf (`docs-kernel/ISSUE-ENTWURF.md`, nicht gepostet) bleibt
+3. **Konkreter nächster Messschritt (offen):** Warum wird beim GLM-Q2-Streaming-Lauf der
+   Streaming-Expert-Cache nicht befüllt („streaming experts 0.00 GiB", keine Cache-Statistikzeile),
+   obwohl der Planner 77,84 GiB dynamischen Cache vorsieht und `--ssd-streaming` aktiv ist? Wenn Q2
+   den Cache nutzen würde, wäre ein weiterer Gewinn plausibel; wenn es Absicht ist (Q2 passt ohnehin
+   in RAM), gehört das dokumentiert. Ebenso offen: Q2-Zahlen sind warm, ein kalter Lauf mit `purge`
+   (Admin) fehlt.
+4. **Upstream-Einordnung:** Der Issue-Entwurf (`docs-kernel/ISSUE-ENTWURF.md`, nicht gepostet) bleibt
    inhaltlich korrekt. Zu ergänzen wären die neuen Zahlen aus §3: GPU-Anteil **31 %** (nicht 15 %),
    Adressauflösung **0,49 ms/Token**, I/O **0,52 GiB/Token** bei 43 % Geräteauslastung,
    Nebenläufigkeitsunempfindlichkeit des Ladepfads. Damit wäre die Antwort auf die Frage im Entwurf
    („Is the intended direction for GLM to move this per-layer bookkeeping to the GPU?") belegbar:
    **nein — der Adresspfad ist nicht der Engpass.**
-4. **Nicht geprüft (bewusst offen, außerhalb des Auftrags):** Vision-Gegentest und Q2-resident-
+5. **Nicht geprüft (bewusst offen, außerhalb des Auftrags):** Vision-Gegentest und Q2-resident-
    Regressionstest aus Phase 3 — sie sind erst nach einem bestandenen Phase-1-Gate sinnvoll; ohne
-   Engine-Änderung gibt es kein Regressionsrisiko (byte-identisch in allen 11 Läufen belegt).
-5. **Aufräumen:** Worktree enthält ausschließlich `73be92c` (Instrumentierung) sowie die
-   untracked Dateien `docs-kernel/` und `FORTSCHRITT.md`/`REPORT.md`. Produktions-Klon
+   Engine-Änderung gibt es kein Regressionsrisiko (byte-identisch in allen 11 Q4-Läufen belegt).
+6. **Aufräumen:** Worktree enthält ausschließlich die Commits `73be92c` (Instrumentierung) und
+   `79eb807` (Dokumentation) sowie die untracked Dateien `docs-kernel/`; Produktions-Klon
    `/Users/michaelkuebbeler/ai-workspace/localAI/ds4` unverändert (kein Commit, kein Push,
-   Port 8008 frei).
+   Port 8008 frei, kein Server gestartet/gestoppt). Rohdaten: `/tmp/ds4-kernel-*`,
+   `/tmp/ds4-q2*.{out,err}`, `/tmp/probe-io.sh`, `/tmp/q2-test.sh`, `/tmp/io-analyze.py`,
+   `/tmp/tl-analyze.py`, `/tmp/ssd-bw3.py`.
