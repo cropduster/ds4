@@ -1340,6 +1340,150 @@ static void ds4_gpu_close_batch_encoder(void) {
 static double g_gpu_busy_accum;
 static uint64_t g_gpu_busy_cbs;
 
+/* ---------------------------------------------------------------------------
+ * Phase-0-Instrumentierung (env: DS4_METAL_PHASE0_PROFILE=1)
+ *
+ * Ziel: echte GPU-Ausfuehrungszeit von Host-Zeit/Wartezeit je Layer x Token
+ * trennen.  Die vorhandene Stage-Zahl (pair/down) misst Encode+Sync, nicht die
+ * GPU-Ausfuehrung; hier werden stattdessen die Metal-Timestamps der Command
+ * Buffer (GPUStartTime/GPUEndTime) sowie die Wartezeit im waitUntilCompleted
+ * aufsummiert.
+ *
+ * gpu_busy_union_ms: Vereinigung der GPU-Zeitintervalle -> "GPU war wirklich
+ *   beschaeftigt", ohne Doppelzaehlung nebenlaeufiger Command Buffer.
+ * gpu_span_sum_ms: naive Summe aller Spans (Vergleichswert, kann doppelt
+ *   zaehlen, wenn Command Buffer ueberlappen).
+ * host_wait_ms: Wandzeit, die der Host in waitUntilCompleted verbringt.
+ *
+ * Zusaetzlich wird die Host-Kette des GLM-Routed-MoE (Cache-Peek/Adresstabelle
+ * vs. Missing-Load/Slot-Install) getrennt gezaehlt.
+ * ------------------------------------------------------------------------- */
+static int g_phase0_decided;
+static int g_phase0_enabled_flag;
+static uint64_t g_phase0_cbs;
+static double g_phase0_wait_ms;
+static double g_phase0_wait_prev_print;
+static double g_phase0_gpu_busy_ms;
+static double g_phase0_gpu_busy_prev_print;
+static double g_phase0_gpu_span_sum_ms;
+static double g_phase0_union_end;
+static double g_phase0_t_first;
+static double g_phase0_t_last;
+static double g_phase0_t_prev_print;
+static uint64_t g_phase0_moe_calls;
+static double g_phase0_moe_peek_ms;
+static double g_phase0_moe_load_ms;
+static double g_phase0_moe_slot_ms;
+static double g_phase0_moe_tail_ms;
+static double ds4_gpu_now_ms(void);
+
+/* Phase 0: I/O-Intervalltrace der Expert-preads, um Konkurrenz/Serialisierung
+ * des SSD-Pfads zu messen (nur lesend, kein Verhaltenseinfluss). */
+#define DS4_PHASE0_IO_MAX 262144
+typedef struct {
+    double   t0;
+    double   t1;
+    uint64_t bytes;
+} ds4_phase0_io_rec;
+static ds4_phase0_io_rec g_phase0_io[DS4_PHASE0_IO_MAX];
+static uint32_t g_phase0_io_n;
+static int g_phase0_io_decided;
+static int g_phase0_io_flag;
+static int g_phase0_io_dumped;
+
+static int ds4_gpu_phase0_io_trace_enabled(void) {
+    if (!g_phase0_io_decided) {
+        const char *p = getenv("DS4_METAL_PHASE0_IO_TRACE");
+        g_phase0_io_flag = (p && p[0]) ? 1 : 0;
+        g_phase0_io_decided = 1;
+    }
+    return g_phase0_io_flag;
+}
+
+static void ds4_gpu_phase0_io_record(double t0, double t1, uint64_t bytes) {
+    if (g_phase0_io_n >= DS4_PHASE0_IO_MAX) return;
+    g_phase0_io[g_phase0_io_n].t0 = t0;
+    g_phase0_io[g_phase0_io_n].t1 = t1;
+    g_phase0_io[g_phase0_io_n].bytes = bytes;
+    g_phase0_io_n++;
+}
+
+static void ds4_gpu_phase0_io_dump(void) {
+    if (g_phase0_io_dumped || g_phase0_io_n == 0) return;
+    const char *path = getenv("DS4_METAL_PHASE0_IO_TRACE");
+    if (!path || !path[0]) return;
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "# t0_ms t1_ms bytes\n");
+    for (uint32_t i = 0; i < g_phase0_io_n; i++) {
+        fprintf(f, "%.4f %.4f %llu\n",
+                g_phase0_io[i].t0,
+                g_phase0_io[i].t1,
+                (unsigned long long)g_phase0_io[i].bytes);
+    }
+    fclose(f);
+    g_phase0_io_dumped = 1;
+    fprintf(stderr, "ds4: phase0 io-trace -> %s (%u reads, %u Slots)\n",
+            path, g_phase0_io_n, (unsigned)DS4_PHASE0_IO_MAX);
+}
+
+static int ds4_gpu_phase0_enabled(void) {
+    if (!g_phase0_decided) {
+        g_phase0_enabled_flag = getenv("DS4_METAL_PHASE0_PROFILE") != NULL;
+        g_phase0_decided = 1;
+    }
+    return g_phase0_enabled_flag;
+}
+
+static void ds4_gpu_phase0_note_command_buffer(id<MTLCommandBuffer> cb,
+                                               double wait_ms) {
+    if (!cb || cb.status != MTLCommandBufferStatusCompleted) return;
+    const double start = cb.GPUStartTime * 1e3;
+    const double end = cb.GPUEndTime * 1e3;
+    const double now = ds4_gpu_now_ms();
+    if (g_phase0_t_first == 0.0) g_phase0_t_first = now;
+    g_phase0_t_last = now;
+    g_phase0_cbs++;
+    g_phase0_wait_ms += wait_ms;
+    if (start <= 0.0 || end <= start) return;
+    const double span = end - start;
+    g_phase0_gpu_span_sum_ms += span;
+    if (g_phase0_union_end == 0.0 || start >= g_phase0_union_end) {
+        g_phase0_gpu_busy_ms += span;
+    } else if (end > g_phase0_union_end) {
+        g_phase0_gpu_busy_ms += end - g_phase0_union_end;
+    }
+    if (end > g_phase0_union_end) g_phase0_union_end = end;
+}
+
+static void ds4_gpu_phase0_print(const char *scope) {
+    if (!ds4_gpu_phase0_enabled()) return;
+    const double tp = g_phase0_t_prev_print != 0.0 ? g_phase0_t_prev_print : g_phase0_t_first;
+    fprintf(stderr,
+            "ds4:   phase0 %s cbs=%llu host_wait_total=%.1f ms host_wait_delta=%.1f ms "
+            "gpu_busy_union_total=%.1f ms gpu_busy_union_delta=%.1f ms gpu_span_sum=%.1f ms "
+            "wall_first_to_last=%.1f ms wall_since_prev_print=%.1f ms "
+            "moe_calls=%llu moe_peek_ms=%.1f moe_load_ms=%.1f moe_slot_ms=%.1f moe_tail_ms=%.1f\n",
+            scope ? scope : "?",
+            (unsigned long long)g_phase0_cbs,
+            g_phase0_wait_ms,
+            g_phase0_wait_ms - g_phase0_wait_prev_print,
+            g_phase0_gpu_busy_ms,
+            g_phase0_gpu_busy_ms - g_phase0_gpu_busy_prev_print,
+            g_phase0_gpu_span_sum_ms,
+            g_phase0_t_last - g_phase0_t_first,
+            g_phase0_t_last - tp,
+            (unsigned long long)g_phase0_moe_calls,
+            g_phase0_moe_peek_ms,
+            g_phase0_moe_load_ms,
+            g_phase0_moe_slot_ms,
+            g_phase0_moe_tail_ms);
+    g_phase0_wait_prev_print = g_phase0_wait_ms;
+    g_phase0_gpu_busy_prev_print = g_phase0_gpu_busy_ms;
+    g_phase0_t_prev_print = g_phase0_t_last;
+    if (g_phase0_moe_calls > 0) ds4_gpu_phase0_io_dump();
+}
+
 /* A failed command buffer can leave a cross-threadgroup arrival counter at an
  * arbitrary partial value.  Drop cached ownership instead of CPU-resetting
  * buffers that another in-flight command buffer might still reference; bound
@@ -1352,7 +1496,12 @@ static void ds4_gpu_invalidate_completion_counters(void) {
 }
 
 static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *label) {
+    const int phase0 = ds4_gpu_phase0_enabled();
+    const double phase0_t0 = phase0 ? ds4_gpu_now_ms() : 0.0;
     [cb waitUntilCompleted];
+    if (phase0) {
+        ds4_gpu_phase0_note_command_buffer(cb, ds4_gpu_now_ms() - phase0_t0);
+    }
     if (getenv("DS4_METAL_CB_TIMES")) {
         static double prev_gpu_end;
         static uint64_t n_printed;
@@ -4286,6 +4435,7 @@ static void ds4_gpu_stream_expert_timing_print(
             (unsigned long long)s.cache_mixed_layers,
             cache_resident_experts_avg,
             cache_missing_experts_avg);
+    ds4_gpu_phase0_print(scope);
 }
 
 static void ds4_gpu_print_task_memory_report(void) {
@@ -13457,6 +13607,7 @@ static int ds4_gpu_stream_expert_pread_into(
         return 0;
     }
 
+    const int io_trace = ds4_gpu_phase0_io_trace_enabled();
     const double t0 = ds4_gpu_now_ms();
     uint64_t pos = 0;
     int ok = 1;
@@ -13474,6 +13625,9 @@ static int ds4_gpu_stream_expert_pread_into(
         pos += (uint64_t)nread;
     }
     const double dt = ds4_gpu_now_ms() - t0;
+    if (io_trace) {
+        ds4_gpu_phase0_io_record(t0, t0 + dt, pos);
+    }
     if (read_bytes) *read_bytes = pos;
     if (ms_out) *ms_out = dt;
     if (!ok || pos != len) {
@@ -38310,6 +38464,11 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         const int glm_stream_timing =
             ds4_gpu_stream_expert_timing_summary_enabled();
 
+        const int glm_p0 = ds4_gpu_phase0_enabled();
+        const double glm_p0_t0 = glm_p0 ? ds4_gpu_now_ms() : 0.0;
+        double glm_p0_peek_end = 0.0;
+        double glm_p0_load_end = 0.0;
+        double glm_p0_slot_end = 0.0;
         if (use_stream_expert_addr_table) {
             const int had_batch = g_batch_cb != nil;
             int stream_ok = 1;
@@ -38404,6 +38563,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                         stream_resident_mask |= 1u << i;
                     }
                 }
+                if (glm_p0) glm_p0_peek_end = ds4_gpu_now_ms();
                 if (stream_ok && glm_stream_timing) {
                     ds4_gpu_stream_expert_timing_note_cache_class(
                             stream_resident_mask,
@@ -38464,6 +38624,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                             ds4_gpu_stream_expert_cache_configured_budget());
                     stream_ok = 0;
                 }
+                if (glm_p0) glm_p0_load_end = ds4_gpu_now_ms();
                 for (uint32_t i = 0; stream_ok && i < n_expert; i++) {
                     ds4_gpu_stream_expert_cache_entry *entry = stream_entries[i];
                     if (!entry) {
@@ -38495,6 +38656,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                                                               &stream_down_addr_buf)) {
                     stream_ok = 0;
                 }
+                if (glm_p0) glm_p0_slot_end = ds4_gpu_now_ms();
                 g_glm_stream_expert_addr_table_building--;
             }
             if (!have_prefetched_selected && had_batch &&
@@ -38510,6 +38672,17 @@ int ds4_gpu_glm_routed_moe_one_tensor(
             ds4_gpu_stream_expert_cache_prune_global(layer_index,
                                                      stream_selected_ids,
                                                      n_expert);
+        }
+        if (glm_p0) {
+            const double glm_p0_t_end = ds4_gpu_now_ms();
+            const double s1 = glm_p0_peek_end > 0.0 ? glm_p0_peek_end : glm_p0_t_end;
+            const double s2 = glm_p0_load_end > 0.0 ? glm_p0_load_end : s1;
+            const double s3 = glm_p0_slot_end > 0.0 ? glm_p0_slot_end : s2;
+            g_phase0_moe_calls++;
+            g_phase0_moe_peek_ms += s1 - glm_p0_t0;
+            g_phase0_moe_load_ms += s2 - s1;
+            g_phase0_moe_slot_ms += s3 - s2;
+            g_phase0_moe_tail_ms += glm_p0_t_end - s3;
         }
 
         uint64_t gate_inner = 0;
