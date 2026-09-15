@@ -13492,6 +13492,10 @@ typedef struct {
     uint64_t read_bytes;
     double ms;
     int ok;
+    /* Advisory F_RDADVISE request instead of a data pread. Both kinds share
+     * the same parallel task pool so the kernel can start the device work
+     * without the encoding thread paying the fcntl() cost inline. */
+    int readahead_only;
 } ds4_gpu_stream_expert_pread_task;
 
 typedef struct {
@@ -13518,7 +13522,7 @@ typedef struct {
     NSUInteger gate_inners[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
     NSUInteger up_inners[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
     NSUInteger down_inners[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
-    ds4_gpu_stream_expert_pread_task tasks[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED * 3u];
+    ds4_gpu_stream_expert_pread_task tasks[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED * 6u];
     double start_ms;
     double prepare_ms;
 } ds4_gpu_stream_expert_pending_load;
@@ -13641,16 +13645,32 @@ static int ds4_gpu_stream_expert_pread_into(
     return 1;
 }
 
+/* Execute one queued expert I/O task. Advisory readahead tasks issue the
+ * F_RDADVISE request and never fail the load; data tasks fill their slot
+ * buffer through the shared pread path. */
+static void ds4_gpu_stream_expert_pread_task_run(
+        ds4_gpu_stream_expert_pread_task *task) {
+    if (!task) return;
+    if (task->readahead_only) {
+        ds4_gpu_stream_expert_readahead_range(task->offset, task->len);
+        task->read_bytes = 0;
+        task->ms = 0.0;
+        task->ok = 1;
+        return;
+    }
+    task->ok = ds4_gpu_stream_expert_pread_into(task->offset,
+                                                task->len,
+                                                task->dst,
+                                                &task->read_bytes,
+                                                &task->ms);
+}
+
 static void *ds4_gpu_stream_expert_pread_worker(void *arg) {
     ds4_gpu_stream_expert_pread_worker_args *wa =
         (ds4_gpu_stream_expert_pread_worker_args *)arg;
     for (uint32_t i = wa->worker_index; i < wa->n_tasks; i += wa->n_workers) {
         ds4_gpu_stream_expert_pread_task *task = &wa->tasks[i];
-        task->ok = ds4_gpu_stream_expert_pread_into(task->offset,
-                                                    task->len,
-                                                    task->dst,
-                                                    &task->read_bytes,
-                                                    &task->ms);
+        ds4_gpu_stream_expert_pread_task_run(task);
     }
     return NULL;
 }
@@ -13705,11 +13725,7 @@ static void *ds4_gpu_stream_expert_pread_pool_worker(void *arg) {
                 &g_stream_expert_pread_pool_tasks[task_index];
             pthread_mutex_unlock(&g_stream_expert_pread_pool_mutex);
 
-            task->ok = ds4_gpu_stream_expert_pread_into(task->offset,
-                                                        task->len,
-                                                        task->dst,
-                                                        &task->read_bytes,
-                                                        &task->ms);
+            ds4_gpu_stream_expert_pread_task_run(task);
 
             pthread_mutex_lock(&g_stream_expert_pread_pool_mutex);
         }
@@ -16885,18 +16901,36 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
                     ds4_gpu_now_ms() - reuse_t0);
         }
     }
+    /* Advisory readahead requests are queued as pool tasks ahead of the data
+     * reads: the workers fire them concurrently, so the device starts fetching
+     * as soon as the selection is known while the encoding thread prepares the
+     * slot buffers instead of spending the fcntl() time serially. */
+    for (uint32_t load_i = 0;
+         load_i < p->n_loads &&
+         p->n_tasks + 3u <= DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED * 6u;
+         load_i++) {
+        const uint32_t slot = p->load_slots[load_i];
+        p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
+            .offset = p->gate_abs_offsets[slot],
+            .len = gate_expert_bytes,
+            .readahead_only = 1,
+        };
+        p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
+            .offset = p->up_abs_offsets[slot],
+            .len = gate_expert_bytes,
+            .readahead_only = 1,
+        };
+        p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
+            .offset = p->down_abs_offsets[slot],
+            .len = down_expert_bytes,
+            .readahead_only = 1,
+        };
+    }
     for (uint32_t load_i = 0; load_i < p->n_loads; load_i++) {
         const uint32_t slot = p->load_slots[load_i];
         const uint32_t expert = (uint32_t)p->selected_ids[slot];
         const int force_reuse =
             cache_budget != 0 && reserved_entries >= cache_budget;
-
-        ds4_gpu_stream_expert_readahead_range(p->gate_abs_offsets[slot],
-                                              gate_expert_bytes);
-        ds4_gpu_stream_expert_readahead_range(p->up_abs_offsets[slot],
-                                              gate_expert_bytes);
-        ds4_gpu_stream_expert_readahead_range(p->down_abs_offsets[slot],
-                                              down_expert_bytes);
 
         if (load_i < batch_reuse_count &&
             batch_reuse[load_i].gate_buffer &&
@@ -17141,9 +17175,35 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
         up_inners[i] = 0;
         down_inners[i] = 0;
     }
-    ds4_gpu_stream_expert_pread_task tasks[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED * 3u];
+    ds4_gpu_stream_expert_pread_task tasks[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED * 6u];
     memset(tasks, 0, sizeof(tasks));
     uint32_t n_tasks = 0;
+    /* Queue the advisory readahead requests as pool tasks ahead of the data
+     * reads (see the early-load path): the workers issue them concurrently
+     * instead of the encoding thread paying the fcntl() cost serially. */
+    if (!gpu_copy_source) {
+        for (uint32_t load_i = 0;
+             load_i < n_loads &&
+             n_tasks + 3u <= DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED * 6u;
+             load_i++) {
+            const uint32_t slot = load_slots[load_i];
+            tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
+                .offset = gate_abs_offsets[slot],
+                .len = gate_expert_bytes,
+                .readahead_only = 1,
+            };
+            tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
+                .offset = up_abs_offsets[slot],
+                .len = gate_expert_bytes,
+                .readahead_only = 1,
+            };
+            tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
+                .offset = down_abs_offsets[slot],
+                .len = down_expert_bytes,
+                .readahead_only = 1,
+            };
+        }
+    }
     const uint32_t cache_budget =
         ds4_gpu_stream_expert_cache_configured_budget();
     uint32_t reserved_entries = g_stream_expert_cache_entry_count;
@@ -17180,15 +17240,6 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
         const uint32_t expert = (uint32_t)selected_ids[slot];
         const int force_reuse =
             cache_budget != 0 && reserved_entries >= cache_budget;
-
-        if (!gpu_copy_source) {
-            ds4_gpu_stream_expert_readahead_range(gate_abs_offsets[slot],
-                                                  gate_expert_bytes);
-            ds4_gpu_stream_expert_readahead_range(up_abs_offsets[slot],
-                                                  gate_expert_bytes);
-            ds4_gpu_stream_expert_readahead_range(down_abs_offsets[slot],
-                                                  down_expert_bytes);
-        }
 
         if (load_i < batch_reuse_count &&
             batch_reuse[load_i].gate_buffer &&
