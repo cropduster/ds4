@@ -4331,8 +4331,20 @@ static int ds4_gpu_moe_path_profile_enabled(void) {
     return getenv("DS4_METAL_MOE_PATH_PROFILE") != NULL;
 }
 
+static void ds4_gpu_moe_path_exit_print(void);
+
+/* The MTP generation loop never reaches the memory-report snapshot points, so
+ * the counters are also dumped once at process exit (env-gated). */
+static void ds4_gpu_moe_path_profile_register(void) {
+    static int registered = 0;
+    if (registered) return;
+    registered = 1;
+    (void)atexit(ds4_gpu_moe_path_exit_print);
+}
+
 static void ds4_gpu_moe_path_note_one(uint32_t n_tokens) {
     if (!ds4_gpu_moe_path_profile_enabled()) return;
+    ds4_gpu_moe_path_profile_register();
     if (n_tokens <= 1) {
         g_moe_path_counters.one_calls++;
     } else {
@@ -4382,6 +4394,10 @@ static void ds4_gpu_moe_path_print(const char *scope) {
             ds4_gpu_gib(c.union_bytes),
             c.union_calls ? (double)c.union_unique_experts / (double)c.union_calls : 0.0,
             (unsigned long long)c.generic_one_calls);
+}
+
+static void ds4_gpu_moe_path_exit_print(void) {
+    ds4_gpu_moe_path_print("exit");
 }
 
 static void ds4_gpu_stream_expert_timing_print(
