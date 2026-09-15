@@ -4307,6 +4307,83 @@ static int ds4_gpu_stream_expert_timing_has_data(
            s.cache_mixed_layers != 0;
 }
 
+/* Diagnostic counters for the routed-MoE dispatch shape: they answer whether a
+ * multi-row (draft+verify) pass reaches the streaming batch path with one
+ * deduplicated expert load per layer, or degrades into per-row lookups. Gated
+ * by DS4_METAL_MOE_PATH_PROFILE=1, behaviour-neutral. */
+typedef struct {
+    uint64_t one_calls;
+    uint64_t one_layers;
+    uint64_t batch_calls;
+    uint64_t batch_tokens;
+    uint64_t batch_stream_calls;
+    uint64_t batch_stream_tokens;
+    uint64_t union_calls;
+    uint64_t union_tokens;
+    uint64_t union_unique_experts;
+    uint64_t union_bytes;
+    uint64_t generic_one_calls;
+} ds4_gpu_moe_path_counters;
+
+static ds4_gpu_moe_path_counters g_moe_path_counters;
+
+static int ds4_gpu_moe_path_profile_enabled(void) {
+    return getenv("DS4_METAL_MOE_PATH_PROFILE") != NULL;
+}
+
+static void ds4_gpu_moe_path_note_one(uint32_t n_tokens) {
+    if (!ds4_gpu_moe_path_profile_enabled()) return;
+    if (n_tokens <= 1) {
+        g_moe_path_counters.one_calls++;
+    } else {
+        g_moe_path_counters.batch_calls++;
+        g_moe_path_counters.batch_tokens += n_tokens;
+    }
+}
+
+static void ds4_gpu_moe_path_note_batch_stream(uint32_t n_tokens) {
+    if (!ds4_gpu_moe_path_profile_enabled()) return;
+    g_moe_path_counters.batch_stream_calls++;
+    g_moe_path_counters.batch_stream_tokens += n_tokens;
+}
+
+static void ds4_gpu_moe_path_note_union(uint32_t n_tokens,
+                                        uint32_t n_unique,
+                                        uint64_t expert_bytes) {
+    if (!ds4_gpu_moe_path_profile_enabled()) return;
+    g_moe_path_counters.union_calls++;
+    g_moe_path_counters.union_tokens += n_tokens;
+    g_moe_path_counters.union_unique_experts += n_unique;
+    g_moe_path_counters.union_bytes += (uint64_t)n_unique * expert_bytes;
+}
+
+static void ds4_gpu_moe_path_note_generic_one(void) {
+    if (!ds4_gpu_moe_path_profile_enabled()) return;
+    g_moe_path_counters.generic_one_calls++;
+}
+
+static void ds4_gpu_moe_path_print(const char *scope) {
+    if (!ds4_gpu_moe_path_profile_enabled()) return;
+    const ds4_gpu_moe_path_counters c = g_moe_path_counters;
+    fprintf(stderr,
+            "ds4:   moe path profile %s one_calls=%llu batch_calls=%llu "
+            "batch_tokens=%llu batch_stream_calls=%llu batch_stream_tokens=%llu "
+            "union_calls=%llu union_tokens=%llu union_unique_experts=%llu "
+            "union_bytes=%.2f GiB unique_per_union=%.2f generic_one_calls=%llu\n",
+            scope,
+            (unsigned long long)c.one_calls,
+            (unsigned long long)c.batch_calls,
+            (unsigned long long)c.batch_tokens,
+            (unsigned long long)c.batch_stream_calls,
+            (unsigned long long)c.batch_stream_tokens,
+            (unsigned long long)c.union_calls,
+            (unsigned long long)c.union_tokens,
+            (unsigned long long)c.union_unique_experts,
+            ds4_gpu_gib(c.union_bytes),
+            c.union_calls ? (double)c.union_unique_experts / (double)c.union_calls : 0.0,
+            (unsigned long long)c.generic_one_calls);
+}
+
 static void ds4_gpu_stream_expert_timing_print(
         const char *scope,
         ds4_gpu_stream_expert_timing_snapshot s) {
@@ -4436,6 +4513,7 @@ static void ds4_gpu_stream_expert_timing_print(
             cache_resident_experts_avg,
             cache_missing_experts_avg);
     ds4_gpu_phase0_print(scope);
+    ds4_gpu_moe_path_print(scope);
 }
 
 static void ds4_gpu_print_task_memory_report(void) {
@@ -17738,6 +17816,12 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         ds4_gpu_stream_expert_cache_note_frequency_hotness(layer,
                                                            frequency,
                                                            n_total_expert);
+    }
+    if (ok) {
+        const uint64_t union_expert_bytes =
+            gate_expert_bytes > (UINT64_MAX - down_expert_bytes) / 2ull ?
+                UINT64_MAX : gate_expert_bytes * 2ull + down_expert_bytes;
+        ds4_gpu_moe_path_note_union(n_tokens, unique_count, union_expert_bytes);
     }
     /*
      * When the layer's unique selected set does not fit the cache budget, the
@@ -38388,6 +38472,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         const ds4_gpu_tensor *x,
         bool                    force_resident) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    ds4_gpu_moe_path_note_one(1);
     /* TP sharding: only the owned contiguous expert range is mapped,
      * so bind from the owned base, validate only its bytes, and tell the
      * kernels the first expert id present at that base. */
@@ -39747,6 +39832,7 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
         bool                    allow_grouped,
         bool                    force_scalar_q4_pair) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    ds4_gpu_moe_path_note_one(n_tokens);
     if (!out || !mid || !model_map || !selected || !weights || !x ||
         n_tokens == 0 ||
         n_total_expert == 0 || n_expert == 0 || n_expert > 256u ||
@@ -39988,6 +40074,7 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
         if (!pair_pipeline || !down_pipeline) return 0;
 
         if (use_stream_expert_addr_table) {
+            ds4_gpu_moe_path_note_batch_stream(n_tokens);
             const int had_batch = g_batch_cb != nil;
             if (had_batch && ds4_gpu_end_commands() == 0) {
                 return 0;
@@ -40709,6 +40796,7 @@ int ds4_gpu_routed_moe_one_tensor(
         __attribute__((cleanup(ds4_gpu_parallel_ffn_scope_cleanup))) =
             g_parallel_q8_pending;
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    ds4_gpu_moe_path_note_generic_one();
     /* TP sharding: only the owned contiguous expert range is mapped,
      * so bind from the owned base, validate only its bytes, and tell the
      * kernels the first expert id present at that base. */
