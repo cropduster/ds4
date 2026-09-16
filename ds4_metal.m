@@ -12710,6 +12710,7 @@ int ds4_gpu_set_aux_model_map_range(
     }
 
     @autoreleasepool {
+        const double t0 = ds4_gpu_now_ms();
         uint64_t mapped_total = 0;
         if (!ds4_gpu_add_model_view_range(model_map,
                                           model_size,
@@ -12720,7 +12721,7 @@ int ds4_gpu_set_aux_model_map_range(
                                           &mapped_total)) {
             return 0;
         }
-        if (!ds4_gpu_finish_model_views(0.0, mapped_total, map_offset)) {
+        if (!ds4_gpu_finish_model_views(t0, mapped_total, map_offset)) {
             return 0;
         }
         g_last_aux_map = model_map;
