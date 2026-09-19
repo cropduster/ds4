@@ -12918,6 +12918,63 @@ static bool glm_tool_turn_checkpoint_eligible(const request *r, const char *fini
            memcmp(r->prompt_text + prompt_len - tag_len, think_tag, tag_len) == 0;
 }
 
+/* GLM counterpart of the Qwen tool-turn key, with the surface the next chat
+ * request really renders: the prompt's trailing open think tag, an empty
+ * reasoning payload, the content and the canonical tool-call text.  The
+ * original attempt rebuilt the key as prompt-minus-tag + close-tag + content,
+ * which never byte-matched the re-rendered prompt, so every follow-up turn
+ * re-prefilled its whole prefix (measured: 20793 tokens / ~98 s). */
+static char *build_glm_tool_turn_visible_text(const request *r,
+                                              const char *finish,
+                                              bool inside_thinking,
+                                              const char *content,
+                                              const tool_calls *calls) {
+    if (!r || !calls || calls->len == 0) return NULL;
+    if (r->kind != REQ_CHAT || r->image_count != 0) return NULL;
+    if (r->api == API_RESPONSES || r->api == API_ANTHROPIC) return NULL;
+    if (r->model_syntax != SERVER_MODEL_SYNTAX_GLM) return NULL;
+    if (!r->prompt_text || !r->prompt_text[0]) return NULL;
+    /* Use the decode finish, not the parser's promoted status: repaired,
+     * truncated or unclosed output is not this frontier. */
+    if (!finish || strcmp(finish, "tool_calls") || inside_thinking) return NULL;
+    const char *think_tag = "<think>";
+    const size_t tag_len = strlen(think_tag);
+    const size_t prompt_len = strlen(r->prompt_text);
+    if (prompt_len < tag_len ||
+        memcmp(r->prompt_text + prompt_len - tag_len, think_tag, tag_len) != 0) {
+        return NULL;
+    }
+    buf visible = {0};
+    buf_puts(&visible, r->prompt_text);
+    buf_puts(&visible, "</think>");
+    append_trimmed_text(&visible, content ? content : "");
+    append_tool_calls_text_for_syntax(&visible, SERVER_MODEL_SYNTAX_GLM,
+                                      calls, r ? &r->tool_orders : NULL);
+    return buf_take(&visible);
+}
+
+static bool remember_glm_tool_turn_visible_checkpoint(server *s, server_slot *slot,
+                                                      job *j, const char *ctx,
+                                                      uint64_t trace_id,
+                                                      const char *finish,
+                                                      bool inside_thinking,
+                                                      const char *content,
+                                                      const tool_calls *calls) {
+    char *visible = build_glm_tool_turn_visible_text(&j->req, finish,
+                                                     inside_thinking, content,
+                                                     calls);
+    if (!visible) return false;
+    thinking_live_remember(s, slot, visible, &j->req);
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: glm tool-turn visible checkpoint remembered ctx=%s live=%d visible=%zu",
+               ctx, ds4_session_pos(slot->session), strlen(visible));
+    trace_event(s, trace_id,
+                "glm tool-turn visible checkpoint remembered: live=%d visible=%zu",
+                ds4_session_pos(slot->session), strlen(visible));
+    free(visible);
+    return true;
+}
+
 /* After a successful tool-call finish, make the live checkpoint match what the
  * next request will render.  Usually that is just the exact DSML remembered by
  * tool id.  If a client sends a tool call without an id we know, the fallback
@@ -14509,6 +14566,11 @@ decode_again:
                 s, slot, j, ctx_span, finish, thinking.inside,
                 tool_turn_content,
                 &parsed_calls);
+        if (!checkpoint_remembered) {
+            checkpoint_remembered = remember_glm_tool_turn_visible_checkpoint(
+                    s, slot, j, ctx_span, trace_id, finish, thinking.inside,
+                    tool_turn_content, &parsed_calls);
+        }
         if (!checkpoint_remembered &&
             glm_tool_turn_checkpoint_eligible(&j->req, finish, thinking.inside,
                                               tool_turn_content))
@@ -18084,6 +18146,74 @@ static void test_qwen_tool_checkpoint_round_trip(void) {
     free(reasoning);
     free(generated);
     tool_calls_free(&calls);
+}
+
+static void test_glm_tool_turn_visible_checkpoint_matches_render(void) {
+    /* prompt_text (ending in the open think tag) plus the GLM tool-turn
+     * visible suffix must be a byte prefix of the next rendered request. */
+    request r;
+    request_init(&r, REQ_CHAT, 64);
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+    r.think_mode = DS4_THINK_HIGH;
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("run it");
+    chat_msgs_push(&msgs, user);
+    tool_schema_orders orders = make_bash_order();
+    char *prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, &orders, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    const size_t prompt_len = strlen(prompt);
+    TEST_ASSERT(prompt_len >= 7 &&
+                !memcmp(prompt + prompt_len - 7, "<think>", 7));
+    /* The live prompt is what the turn generates into: it ends with the
+     * open think block, which the checkpoint builder must preserve. */
+    r.prompt_text = xstrdup(prompt);
+
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\":\"pwd\"}");
+    tool_calls_push(&calls, tc);
+    char *visible = build_glm_tool_turn_visible_text(&r, "tool_calls", false,
+                                                     "", &calls);
+    TEST_ASSERT(visible != NULL);
+    TEST_ASSERT(!strncmp(visible, prompt, prompt_len));
+    TEST_ASSERT(strstr(visible, "</think>") != NULL);
+    /* Non-tool finishes and open thinking are not a checkpoint frontier. */
+    TEST_ASSERT(!build_glm_tool_turn_visible_text(&r, "stop", false, "", &calls));
+    TEST_ASSERT(!build_glm_tool_turn_visible_text(&r, "length", false, "", &calls));
+    TEST_ASSERT(!build_glm_tool_turn_visible_text(&r, "tool_calls", true, "", &calls));
+
+    /* Replay: the next request (assistant tool call + tool result) must render
+     * exactly the remembered visible prefix, then continue with the result. */
+    chat_msg asst = {0};
+    asst.role = xstrdup("assistant");
+    asst.content = xstrdup("");
+    tool_call tc2 = {0};
+    tc2.name = xstrdup("bash");
+    tc2.arguments = xstrdup("{\"command\":\"pwd\"}");
+    tool_calls_push(&asst.calls, tc2);
+    chat_msgs_push(&msgs, asst);
+    chat_msg res = {0};
+    res.role = xstrdup("tool");
+    res.content = xstrdup("/tmp");
+    chat_msgs_push(&msgs, res);
+    char *next = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, &orders, DS4_THINK_HIGH);
+    TEST_ASSERT(next != NULL);
+    const size_t visible_len = strlen(visible);
+    TEST_ASSERT(!strncmp(next, visible, visible_len));
+    TEST_ASSERT(strstr(next + visible_len, "/tmp") != NULL);
+
+    free(next);
+    free(visible);
+    free(prompt);
+    tool_calls_free(&calls);
+    tool_schema_orders_free(&orders);
+    chat_msgs_free(&msgs);
+    request_free(&r);
 }
 
 static void test_unterminated_reasoning_content_recovered_on_stop(void) {
@@ -22246,6 +22376,7 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen_literal_tool_end_in_argument();
     test_qwen_string_arguments_follow_schema();
     test_qwen_tool_checkpoint_round_trip();
+    test_glm_tool_turn_visible_checkpoint_matches_render();
     test_unterminated_reasoning_content_recovered_on_stop();
     test_unterminated_reasoning_stays_empty_on_length();
     test_unterminated_reasoning_recovered_on_qwen_syntax();
