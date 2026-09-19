@@ -13069,6 +13069,29 @@ static bool remember_glm_tool_turn_visible_checkpoint(server *s, server_slot *sl
     return true;
 }
 
+/* GLM can sample a turn-ending token while the think block is still open: the
+ * model "finishes" mid-reasoning, the parser only finds an unterminated
+ * reasoning buffer, and the turn collapses into the content-recovery path.
+ * Measured on GLM-5.3-Flash-Q2 at ~57k context: 1124 reasoning tokens, then
+ * finish=stop with "thinking not closed" as the only diagnostic, and the
+ * client saw a truncated thought instead of an answer.  Deny the stop token
+ * while the block is open and keep sampling; the budget caps how often we
+ * override the model so the turn can still end normally. */
+#define GLM_THINKING_STOP_DENY_MAX 32
+
+static bool glm_thinking_stop_deny(const request *r,
+                                   const thinking_state *thinking,
+                                   int *budget) {
+    if (!budget || *budget <= 0) return false;
+    if (!r || r->kind != REQ_CHAT) return false;
+    if (r->api == API_RESPONSES || r->api == API_ANTHROPIC) return false;
+    if (r->model_syntax != SERVER_MODEL_SYNTAX_GLM) return false;
+    if (!ds4_think_mode_enabled(r->think_mode)) return false;
+    if (!thinking || !thinking->inside) return false;
+    (*budget)--;
+    return true;
+}
+
 /* After a successful tool-call finish, make the live checkpoint match what the
  * next request will render.  Usually that is just the exact DSML remembered by
  * tool id.  If a client sends a tool call without an id we know, the fallback
@@ -14022,6 +14045,8 @@ decode_again:
     int next_decode_log = 50;
     const char *stop_detail = max_tokens == room ? "context limit" : "output limit";
     int stop_token = -1;
+    int glm_deny_budget = GLM_THINKING_STOP_DENY_MAX;
+    int glm_deny_count = 0;
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
     const double decode_t0 = now_sec();
     double last_decode_log_t = decode_t0;
@@ -14078,10 +14103,39 @@ decode_again:
         if (ds4_token_is_stop_for_think_mode(s->engine,
                                              token,
                                              j->req.think_mode)) {
-            finish = "stop";
-            stop_detail = "stop token";
-            stop_token = token;
-            break;
+            if (glm_thinking_stop_deny(&j->req, &thinking,
+                                       &glm_deny_budget)) {
+                int replacement = ds4_session_argmax_ignoring_eos(
+                    slot->session, j->req.think_mode);
+                if (replacement >= 0) {
+                    /* Turn-end token while the think block is open:
+                     * take the best non-stop token and keep going.
+                     * Nothing was committed, so the KV still holds
+                     * exactly the text we emit. */
+                    token = replacement;
+                    glm_deny_count++;
+                    if (glm_deny_count == 1 || glm_deny_count % 8 == 0) {
+                        server_log(DS4_LOG_GENERATION,
+                                   "ds4-server: chat ctx=%s%s%s thinking stop-token denied (count=%d budget=%d)",
+                                   ctx_span, req_flags[0] ? " " : "",
+                                   req_flags, glm_deny_count,
+                                   glm_deny_budget);
+                    }
+                    trace_event(s, trace_id,
+                                "thinking stop token denied: count=%d budget=%d",
+                                glm_deny_count, glm_deny_budget);
+                } else {
+                    finish = "stop";
+                    stop_detail = "stop token";
+                    stop_token = token;
+                    break;
+                }
+            } else {
+                finish = "stop";
+                stop_detail = "stop token";
+                stop_token = token;
+                break;
+            }
         }
 
         int toks[17];
@@ -14143,6 +14197,26 @@ decode_again:
             if (ds4_token_is_stop_for_think_mode(s->engine,
                                                  token,
                                                  j->req.think_mode)) {
+                if (glm_thinking_stop_deny(&j->req, &thinking,
+                                           &glm_deny_budget)) {
+                    /* Speculatively drafted stop while reasoning is
+                     * open: drop the draft here and let the
+                     * kept<ntok path below rewind the KV to
+                     * block_start+kept, so the outer loop resamples
+                     * from clean logits. */
+                    glm_deny_count++;
+                    if (glm_deny_count == 1 || glm_deny_count % 8 == 0) {
+                        server_log(DS4_LOG_GENERATION,
+                                   "ds4-server: chat ctx=%s%s%s drafted thinking stop-token denied (count=%d budget=%d)",
+                                   ctx_span, req_flags[0] ? " " : "",
+                                   req_flags, glm_deny_count,
+                                   glm_deny_budget);
+                    }
+                    trace_event(s, trace_id,
+                                "drafted thinking stop token denied: count=%d budget=%d",
+                                glm_deny_count, glm_deny_budget);
+                    break;
+                }
                 finish = "stop";
                 stop_detail = "stop token";
                 stop_token = token;
@@ -18987,6 +19061,33 @@ static void test_qwen_tool_checkpoint_round_trip(void) {
     tool_calls_free(&calls);
 }
 
+static void test_glm_thinking_stop_deny_budget(void) {
+    /* Generation starts inside the prompt's open think block: a stop token is
+     * denied there, the budget is finite so the turn can still end, and once
+     * the block is closed (or the syntax differs) nothing is denied. */
+    request r;
+    request_init(&r, REQ_CHAT, 64);
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+    r.think_mode = DS4_THINK_HIGH;
+    thinking_state st = thinking_state_from_prompt(&r);
+    int budget = 2;
+    TEST_ASSERT(glm_thinking_stop_deny(&r, &st, &budget));
+    TEST_ASSERT(budget == 1);
+    TEST_ASSERT(glm_thinking_stop_deny(&r, &st, &budget));
+    TEST_ASSERT(budget == 0);
+    TEST_ASSERT(!glm_thinking_stop_deny(&r, &st, &budget)); /* budget spent */
+    TEST_ASSERT(budget == 0);
+    thinking_state_feed(&st, "</think>", 8);                /* block closed */
+    budget = 4;
+    TEST_ASSERT(!glm_thinking_stop_deny(&r, &st, &budget));
+    TEST_ASSERT(budget == 4);
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    thinking_state_feed(&st, "<think>", 7);
+    TEST_ASSERT(!glm_thinking_stop_deny(&r, &st, &budget));
+    TEST_ASSERT(budget == 4);
+    request_free(&r);
+}
+
 static void test_glm_tool_turn_visible_checkpoint_matches_render(void) {
     /* prompt_text (ending in the open think tag) plus the GLM tool-turn
      * visible suffix must be a byte prefix of the next rendered request. */
@@ -23265,6 +23366,7 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen_string_arguments_follow_schema();
     test_qwen_tool_checkpoint_round_trip();
     test_glm_tool_turn_visible_checkpoint_matches_render();
+    test_glm_thinking_stop_deny_budget();
     test_unterminated_reasoning_content_recovered_on_stop();
     test_unterminated_reasoning_stays_empty_on_length();
     test_unterminated_reasoning_recovered_on_qwen_syntax();
