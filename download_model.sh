@@ -459,7 +459,9 @@ artifact_identity() {
             ;;
         "$DS41_Q2_FILE")
             expected_bytes=365713686528
-            expected_sha=1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42
+            # 19.10.2026: Upstream-Hash war falsch (1ce6a8f8...); verifiziert gegen
+            # HF lfs.oid, lokale Datei per shasum bestaetigt.
+            expected_sha=5296e85ff64b42ecb62c8d0c0c54e1caa07e3df8e93112f2365ebbaed62ce93a
             ;;
         "$DS41_Q4_FILE")
             expected_bytes=518596067328
