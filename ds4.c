@@ -42211,6 +42211,15 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
          * before overwriting the first Engram table's shared input at layer
          * 14, and before publishing the completed token to the CPU. */
         const bool drain = !queue_layers || il == 13 || il + 1u == DS4_N_LAYER;
+        /* Flush-only pick from upstream PR #1041: submit the queued layer
+         * without waiting, so the GPU starts it while the CPU encodes the
+         * next one. The drain points above stay untouched; the Engram buffer
+         * trick and the resident whole-token path are deliberately NOT taken
+         * (they are gated on !streaming and do nothing here).
+         * Off by default for A/B; enable with DS4_METAL_ENABLE_V41_DECODE_FLUSH. */
+        if (ok && !drain && queue_layers && !layer_resident &&
+            getenv("DS4_METAL_ENABLE_V41_DECODE_FLUSH") &&
+            !ds4_gpu_flush_commands()) ok = false;
         if (drain && !ds4_gpu_end_commands()) ok = false;
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
         if (ok && g->imatrix)
