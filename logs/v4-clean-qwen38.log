@@ -1,0 +1,15 @@
+ds4: Qwen3.8 YaRN factor 1.5 over 262144 native tokens (pairs 14..22 blended, mscale 1.0405)
+ds4: Qwen BF16 n-grams: 95.37 GiB, disk reads only
+ds4: Metal device Apple M4 Max, 128.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 1.957 ms, residency requested in 24987.047 ms, warmup 3.334 ms (mapped 71400.44 MiB from offset 10.51 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+ds4: Metal model views created in 0.027 ms, residency requested in 216.770 ms, warmup 0.309 ms (mapped 588.12 MiB from offset 0.02 MiB)
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 12.50 GiB (raw 9.76 + compressed 2.74) + buffers 13.24 GiB + resident model 69.73 GiB = 95.47 GiB planned
+ds4: memory detail: ctx=393216 prefill_cap=8192 raw_kv_rows=393216 compressed_kv_rows=98305 backend=metal
+0920 12:21:04 ds4-server: context buffers 26358.72 MiB (ctx=393216, backend=metal, prefill_chunk=8192, raw_kv_rows=393216, compressed_kv_rows=98305)
+0920 12:21:05 ds4-server: KV disk cache /Users/michaelkuebbeler/.ds4/clean-qwen38-kv (budget=32768 MiB, cross-quant=accept, min=512, cold_max=30000, continued=10000, trim=32, align=2048, hit_half_life=21600s)
+0920 12:21:05 ds4-server: listening on http://127.0.0.1:8008
+0920 12:30:48 ds4-server: shutdown requested, draining requests

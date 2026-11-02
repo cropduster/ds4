@@ -1,0 +1,118 @@
+ds4: Metal device Apple M4 Max, 128.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal SSD streaming mode enabled; full model residency and warmup are skipped
+ds4: SSD streaming auto cache budget
+ds4:   metal recommends 115.23 GiB working set
+ds4:   using 82% total for model + cached experts: 94.00 GiB
+ds4:   non-routed weights: 8.20 GiB
+ds4:   routed expert size: 12.75 MiB
+ds4:   expert budget before prefill reserve: 6891 (85.80 GiB)
+ds4: metal SSD streaming cache target 85.80 GiB; effective 85.80 GiB = 6.38 GiB prefill headroom + 79.43 GiB dynamic cache (6379 experts, 12.75 MiB each)
+ds4: Metal SSD static weights locked 8.20 GiB; pageable 0.00 GiB
+ds4: SSD streaming initial metal model map (1 spans, 0.99 GiB tensor span)
+ds4: Metal model views created in 0.059 ms, residency requested in -0.000 ms, warmup 0.014 ms (mapped 1010.02 MiB from offset 140365.96 MiB)
+ds4: Metal mapped mmaped model as 1 disjoint shared buffers across 1 tensor spans
+ds4: Metal model views created in 0.028 ms, residency requested in 0.000 ms, warmup 0.000 ms (mapped 889.64 MiB from offset 0.02 MiB)
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 3.42 GiB (raw 0.36 + compressed 3.06) + buffers 3.05 GiB + resident model 8.20 GiB + expert cache 79.43 GiB + prefill expert reserve 6.38 GiB = 100.47 GiB planned
+ds4: memory detail: ctx=400000 prefill_cap=4096 raw_kv_rows=4352 compressed_kv_rows=100002 backend=metal
+0920 12:12:40 ds4-server: context buffers 6629.87 MiB (ctx=400000, backend=metal, prefill_chunk=4096, raw_kv_rows=4352, compressed_kv_rows=100002)
+0920 12:12:40 ds4-server: KV disk cache /Users/michaelkuebbeler/.ds4/clean-mxfp4-kv (budget=32768 MiB, cross-quant=accept, min=512, cold_max=30000, continued=10000, trim=32, align=2048, hit_half_life=21600s)
+0920 12:12:40 ds4-server: listening on http://127.0.0.1:8008
+0920 12:12:46 ds4-server: vision embedding encoded; cache=2771559 bytes
+0920 12:12:46 ds4-server: chat ctx=0..215:215 prompt start
+ds4: Metal model views created in 0.184 ms, residency requested in 0.000 ms, warmup 0.000 ms (mapped 4414.44 MiB from offset 5.09 MiB)
+ds4: Metal mapped mmaped model as 5 disjoint shared buffers across 4 tensor spans
+ds4: Metal model views created in 0.248 ms, residency requested in -0.000 ms, warmup 0.000 ms (mapped 3404.44 MiB from offset 8.05 MiB)
+ds4: Metal mapped mmaped model as 5 disjoint shared buffers across 4 tensor spans
+ds4: Metal model views created in 0.128 ms, residency requested in 0.000 ms, warmup 0.000 ms (mapped 3440.94 MiB from offset 11.00 MiB)
+ds4: Metal mapped mmaped model as 5 disjoint shared buffers across 4 tensor spans
+ds4: Metal model views created in 0.152 ms, residency requested in -0.000 ms, warmup 0.000 ms (mapped 3409.59 MiB from offset 9805.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.146 ms, residency requested in -0.000 ms, warmup 0.000 ms (mapped 3437.97 MiB from offset 13069.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.166 ms, residency requested in -0.000 ms, warmup 0.000 ms (mapped 3409.59 MiB from offset 16333.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.128 ms, residency requested in -0.000 ms, warmup 0.000 ms (mapped 3437.97 MiB from offset 19597.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.110 ms, residency requested in 0.000 ms, warmup 0.000 ms (mapped 3409.58 MiB from offset 22861.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.145 ms, residency requested in 0.000 ms, warmup 0.000 ms (mapped 3437.98 MiB from offset 26125.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.161 ms, residency requested in -0.000 ms, warmup 0.000 ms (mapped 3409.58 MiB from offset 29389.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.142 ms, residency requested in 0.000 ms, warmup 0.001 ms (mapped 3437.98 MiB from offset 32653.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.151 ms, residency requested in -0.000 ms, warmup 0.000 ms (mapped 3409.58 MiB from offset 35917.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.133 ms, residency requested in 0.000 ms, warmup 0.000 ms (mapped 3437.97 MiB from offset 39181.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.133 ms, residency requested in 0.000 ms, warmup 0.000 ms (mapped 3409.59 MiB from offset 42445.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.171 ms, residency requested in 0.000 ms, warmup 0.001 ms (mapped 3437.97 MiB from offset 45709.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.130 ms, residency requested in 0.000 ms, warmup 0.000 ms (mapped 3409.59 MiB from offset 48973.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.143 ms, residency requested in 0.000 ms, warmup 0.000 ms (mapped 3437.97 MiB from offset 52237.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.154 ms, residency requested in -0.000 ms, warmup 0.000 ms (mapped 3409.59 MiB from offset 55501.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.194 ms, residency requested in -0.000 ms, warmup 0.000 ms (mapped 3437.97 MiB from offset 58765.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.176 ms, residency requested in 0.000 ms, warmup 0.000 ms (mapped 3409.59 MiB from offset 62029.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.187 ms, residency requested in -0.000 ms, warmup 0.000 ms (mapped 3437.97 MiB from offset 65293.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.191 ms, residency requested in 0.000 ms, warmup 0.000 ms (mapped 3409.58 MiB from offset 68557.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.177 ms, residency requested in 0.000 ms, warmup 0.000 ms (mapped 3437.98 MiB from offset 71821.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.210 ms, residency requested in 0.000 ms, warmup 0.000 ms (mapped 3409.58 MiB from offset 75085.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.142 ms, residency requested in -0.000 ms, warmup 0.000 ms (mapped 3437.97 MiB from offset 78349.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.178 ms, residency requested in 0.000 ms, warmup 0.000 ms (mapped 3409.59 MiB from offset 81613.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.126 ms, residency requested in 0.000 ms, warmup 0.000 ms (mapped 3437.97 MiB from offset 84877.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.120 ms, residency requested in -0.000 ms, warmup 0.001 ms (mapped 3409.59 MiB from offset 88141.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.145 ms, residency requested in -0.000 ms, warmup 0.000 ms (mapped 3437.97 MiB from offset 91405.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.121 ms, residency requested in 0.000 ms, warmup 0.000 ms (mapped 3409.59 MiB from offset 94669.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.135 ms, residency requested in 0.000 ms, warmup 0.000 ms (mapped 3437.97 MiB from offset 97933.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.156 ms, residency requested in 0.000 ms, warmup 0.000 ms (mapped 3409.59 MiB from offset 101197.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.165 ms, residency requested in -0.000 ms, warmup 0.000 ms (mapped 3437.97 MiB from offset 104461.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.182 ms, residency requested in 0.000 ms, warmup 0.000 ms (mapped 3409.58 MiB from offset 107725.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.126 ms, residency requested in -0.000 ms, warmup 0.000 ms (mapped 3437.98 MiB from offset 110989.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.139 ms, residency requested in -0.000 ms, warmup 0.000 ms (mapped 3409.58 MiB from offset 114253.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.155 ms, residency requested in -0.000 ms, warmup 0.001 ms (mapped 3437.98 MiB from offset 117517.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.238 ms, residency requested in 0.000 ms, warmup 0.000 ms (mapped 3409.58 MiB from offset 120781.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.181 ms, residency requested in -0.000 ms, warmup 0.000 ms (mapped 3437.97 MiB from offset 124045.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.325 ms, residency requested in -0.000 ms, warmup 0.000 ms (mapped 3409.59 MiB from offset 127309.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.179 ms, residency requested in 0.000 ms, warmup 0.000 ms (mapped 3437.97 MiB from offset 130573.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 0.165 ms, residency requested in 0.000 ms, warmup 0.000 ms (mapped 3409.59 MiB from offset 133837.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 2.363 ms, residency requested in -0.000 ms, warmup 0.000 ms (mapped 3437.97 MiB from offset 137101.96 MiB)
+ds4: Metal mapped mmaped model as 4 disjoint shared buffers across 3 tensor spans
+ds4: Metal model views created in 1.582 ms, residency requested in 0.000 ms, warmup 0.000 ms (mapped 8395.06 MiB from offset 5.09 MiB)
+ds4: Metal mapped mmaped model as 91 disjoint shared buffers across 90 tensor spans
+0920 12:13:13 ds4-server: chat ctx=0..215:215 prompt done 26.396s
+0920 12:13:20 ds4-server: chat ctx=215..265:50 gen=50 THINKING decoding chunk=7.26 t/s avg=7.26 t/s 6.883s
+0920 12:13:23 ds4-server: chat ctx=265..315:50 gen=100 decoding chunk=13.51 t/s avg=9.45 t/s 10.584s
+0920 12:13:23 ds4-server: thinking live checkpoint remembered ctx=0..215:215 live=315 visible=238
+0920 12:13:23 ds4-server: chat ctx=0..215:215 gen=100 finish=stop 36.981s
+0920 12:13:29 ds4-server: shutdown requested, draining requests

@@ -1,0 +1,40 @@
+ds4: Metal device Apple M4 Max, 128.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal SSD streaming mode enabled; full model residency and warmup are skipped
+ds4: metal SSD streaming cache target 56.00 GiB; effective 56.00 GiB = 7.12 GiB prefill headroom + 48.88 GiB dynamic cache (5273 experts, 9.49 MiB each)
+ds4: Metal SSD static weights locked 9.37 GiB; pageable 0.00 GiB
+ds4: SSD streaming initial metal model map (569 spans, 9.37 GiB tensor span)
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 0.21 GiB (raw 0.01 + compressed 0.20) + buffers 7.68 GiB + resident model 9.37 GiB + expert cache 48.88 GiB + prefill expert reserve 7.12 GiB = 73.25 GiB planned
+ds4: memory detail: ctx=32768 prefill_cap=8192 raw_kv_rows=128 compressed_kv_rows=32769 backend=metal
+1019 18:55:52 ds4-server: context buffers 8073.52 MiB (ctx=32768, backend=metal, prefill_chunk=8192, raw_kv_rows=128, compressed_kv_rows=32769)
+ds4: V4.1 static context buffers 8073.52 MiB (ctx=32768), Engram disk-only
+1019 18:55:52 ds4-server: KV disk cache /Users/michaelkuebbeler/.ds4/server-kv-v41 (budget=32768 MiB, cross-quant=accept, min=512, cold_max=30000, continued=10000, trim=32, align=2048, hit_half_life=21600s)
+1019 18:55:52 ds4-server: listening on http://0.0.0.0:8008
+1019 18:56:50 ds4-server: chat ctx=0..1043:1043 prompt start
+1019 18:57:19 ds4-server: chat ctx=0..1043:1043 prefill chunk 1043/1043 (100.0%) chunk=0.00 t/s avg=35.33 t/s 29.518s
+1019 18:57:19 ds4-server: chat ctx=0..1043:1043 prompt done 29.570s
+1019 18:57:19 ds4-server: kv cache stored tokens=1043 trimmed=0 reason=cold key=token-text size=16.88 MiB save=11.5 ms
+1019 18:57:25 ds4-server: chat ctx=1043..1093:50 gen=50 THINKING decoding chunk=9.08 t/s avg=9.08 t/s 5.508s
+1019 18:57:29 ds4-server: chat ctx=1093..1143:50 gen=100 THINKING decoding chunk=10.96 t/s avg=9.93 t/s 10.072s
+1019 18:57:34 ds4-server: chat ctx=1143..1193:50 gen=150 THINKING decoding chunk=11.93 t/s avg=10.52 t/s 14.263s
+1019 18:57:37 ds4-server: chat ctx=1193..1243:50 gen=200 THINKING decoding chunk=13.00 t/s avg=11.04 t/s 18.110s
+1019 18:57:42 ds4-server: chat ctx=1243..1293:50 gen=250 decoding chunk=11.62 t/s avg=11.15 t/s 22.414s
+1019 18:57:42 ds4-server: chat ctx=1293..1299:6 gen=256 decoding chunk=13.02 t/s avg=11.19 t/s 22.874s
+1019 18:57:42 ds4-server: chat ctx=0..1043:1043 gen=256 finish=length 52.472s
+1019 18:57:44 ds4-server: live kv cache miss live=1299 prompt=1043 common=1043 vision=match reason=token-mismatch
+1019 18:57:44 ds4-server: kv cache stored tokens=1299 trimmed=0 reason=evict key=token-text size=18.44 MiB save=12.9 ms
+1019 18:57:44 ds4-server: kv cache hit text tokens=1043 text=4097 quant=2 key=token-text load=5.8 ms file=/Users/michaelkuebbeler/.ds4/server-kv-v41/f8c92b306d59d46aeb38400997442f138287b6a8.kv
+1019 18:57:44 ds4-server: chat ctx=1043..1043:0 prompt start
+1019 18:57:44 ds4-server: chat ctx=1043..1043:0 prompt done 0.000s
+1019 18:57:49 ds4-server: chat ctx=1043..1093:50 gen=50 THINKING decoding chunk=10.18 t/s avg=10.18 t/s 4.910s
+1019 18:57:53 ds4-server: chat ctx=1093..1143:50 gen=100 THINKING decoding chunk=12.48 t/s avg=11.22 t/s 8.916s
+1019 18:57:56 ds4-server: chat ctx=1143..1193:50 gen=150 THINKING decoding chunk=13.34 t/s avg=11.84 t/s 12.664s
+1019 18:58:01 ds4-server: chat ctx=1193..1243:50 gen=200 decoding chunk=12.03 t/s avg=11.89 t/s 16.820s
+1019 18:58:05 ds4-server: chat ctx=1243..1293:50 gen=250 decoding chunk=12.13 t/s avg=11.94 t/s 20.941s
+1019 18:58:05 ds4-server: chat ctx=1293..1299:6 gen=256 decoding chunk=12.27 t/s avg=11.95 t/s 21.430s
+1019 18:58:05 ds4-server: chat ctx=1043..1043:0 gen=256 finish=length 21.431s
+1019 18:58:19 ds4-server: shutdown requested, draining requests
+1019 18:58:19 ds4-server: persisting resident KV cache before shutdown slot=0 tokens=1299
+1019 18:58:19 ds4-server: kv cache stored tokens=1299 trimmed=0 reason=shutdown key=token-text size=18.44 MiB save=9.1 ms

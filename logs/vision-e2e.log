@@ -1,0 +1,109 @@
+ds4: Metal device Apple M4 Max, 128.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal SSD streaming mode enabled; full model residency and warmup are skipped
+ds4: SSD streaming auto cache budget
+ds4:   metal recommends 115.23 GiB working set
+ds4:   using 82% total for model + cached experts: 94.00 GiB
+ds4:   non-routed weights: 8.20 GiB
+ds4:   routed expert size: 12.75 MiB
+ds4:   expert budget before prefill reserve: 6891 (85.80 GiB)
+ds4: metal SSD streaming cache target 85.80 GiB; effective 85.80 GiB = 6.38 GiB prefill headroom + 79.43 GiB dynamic cache (6379 experts, 12.75 MiB each)
+ds4: Metal SSD static weights locked 8.20 GiB; pageable 0.00 GiB
+ds4: SSD streaming initial metal model map (1 spans, 0.99 GiB tensor span)
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 3.42 GiB (raw 0.36 + compressed 3.06) + buffers 3.05 GiB + resident model 8.20 GiB + expert cache 79.43 GiB + prefill expert reserve 6.38 GiB = 100.47 GiB planned
+ds4: memory detail: ctx=400000 prefill_cap=4096 raw_kv_rows=4352 compressed_kv_rows=100002 backend=metal
+0920 12:06:00 ds4-server: context buffers 6629.87 MiB (ctx=400000, backend=metal, prefill_chunk=4096, raw_kv_rows=4352, compressed_kv_rows=100002)
+0920 12:06:00 ds4-server: KV disk cache /Users/michaelkuebbeler/.ds4/clean-mxfp4-kv (budget=32768 MiB, cross-quant=accept, min=512, cold_max=30000, continued=10000, trim=32, align=2048, hit_half_life=21600s)
+0920 12:06:00 ds4-server: listening on http://127.0.0.1:8008
+0920 12:06:13 ds4-server: vision embedding encoded; cache=2771559 bytes
+0920 12:06:13 ds4-server: chat ctx=0..227:227 prompt start
+0920 12:06:42 ds4-server: chat ctx=0..227:227 prompt done 28.733s
+0920 12:06:49 ds4-server: chat ctx=227..277:50 gen=50 THINKING decoding chunk=6.79 t/s avg=6.79 t/s 7.368s
+0920 12:06:53 ds4-server: chat ctx=277..327:50 gen=100 THINKING decoding chunk=14.95 t/s avg=9.33 t/s 10.713s
+0920 12:06:56 ds4-server: chat ctx=327..377:50 gen=150 THINKING decoding chunk=15.17 t/s avg=10.71 t/s 14.010s
+0920 12:06:59 ds4-server: chat ctx=377..427:50 gen=200 THINKING decoding chunk=17.84 t/s avg=11.90 t/s 16.813s
+0920 12:07:01 ds4-server: chat ctx=427..477:50 gen=250 THINKING decoding chunk=18.91 t/s avg=12.85 t/s 19.457s
+0920 12:07:04 ds4-server: chat ctx=477..527:50 gen=300 THINKING decoding chunk=19.51 t/s avg=13.62 t/s 22.021s
+0920 12:07:07 ds4-server: chat ctx=527..577:50 gen=350 THINKING decoding chunk=19.24 t/s avg=14.22 t/s 24.619s
+0920 12:07:09 ds4-server: chat ctx=577..627:50 gen=400 THINKING decoding chunk=18.37 t/s avg=14.63 t/s 27.341s
+ds4-server: thinking not closed, ignoring incomplete DSML in reasoning
+0920 12:07:09 ds4-server: chat ctx=0..227:227 gen=400 THINKING finish=length 56.076s
+0920 12:07:10 ds4-server: vision embedding encoded; cache=5542337 bytes
+0920 12:07:10 ds4-server: live kv cache miss live=627 prompt=227 common=227 vision=mismatch reason=token-mismatch
+0920 12:07:10 ds4-server: chat ctx=0..227:227 prompt start
+0920 12:07:39 ds4-server: chat ctx=0..227:227 prompt done 29.109s
+0920 12:07:44 ds4-server: chat ctx=227..277:50 gen=50 THINKING decoding chunk=10.90 t/s avg=10.90 t/s 4.587s
+0920 12:07:46 ds4-server: chat ctx=277..327:50 gen=100 THINKING decoding chunk=20.38 t/s avg=14.20 t/s 7.040s
+0920 12:07:49 ds4-server: chat ctx=327..377:50 gen=150 THINKING decoding chunk=19.80 t/s avg=15.68 t/s 9.566s
+0920 12:07:51 ds4-server: chat ctx=377..427:50 gen=200 THINKING decoding chunk=19.66 t/s avg=16.52 t/s 12.108s
+0920 12:07:54 ds4-server: chat ctx=427..477:50 gen=250 THINKING decoding chunk=19.12 t/s avg=16.98 t/s 14.723s
+0920 12:07:56 ds4-server: chat ctx=477..527:50 gen=300 THINKING decoding chunk=20.77 t/s avg=17.51 t/s 17.130s
+0920 12:07:59 ds4-server: chat ctx=527..577:50 gen=350 THINKING decoding chunk=20.61 t/s avg=17.90 t/s 19.556s
+0920 12:08:01 ds4-server: chat ctx=577..627:50 gen=400 THINKING decoding chunk=19.44 t/s avg=18.08 t/s 22.128s
+ds4-server: thinking not closed, ignoring incomplete DSML in reasoning
+0920 12:08:01 ds4-server: chat ctx=0..227:227 gen=400 THINKING finish=length 51.238s
+0920 12:08:16 ds4-server: vision embedding cache hit
+0920 12:08:16 ds4-server: live kv cache miss live=627 prompt=227 common=10 vision=mismatch reason=token-mismatch
+0920 12:08:16 ds4-server: chat ctx=0..227:227 prompt start
+0920 12:08:45 ds4-server: chat ctx=0..227:227 prompt done 29.183s
+0920 12:08:50 ds4-server: chat ctx=227..277:50 gen=50 THINKING decoding chunk=10.66 t/s avg=10.66 t/s 4.691s
+0920 12:08:52 ds4-server: chat ctx=277..327:50 gen=100 THINKING decoding chunk=19.97 t/s avg=13.90 t/s 7.195s
+0920 12:08:55 ds4-server: chat ctx=327..377:50 gen=150 THINKING decoding chunk=20.72 t/s avg=15.61 t/s 9.608s
+0920 12:08:57 ds4-server: chat ctx=377..427:50 gen=200 THINKING decoding chunk=20.72 t/s avg=16.64 t/s 12.021s
+0920 12:08:59 ds4-server: chat ctx=427..477:50 gen=250 THINKING decoding chunk=21.05 t/s avg=17.37 t/s 14.396s
+0920 12:09:02 ds4-server: chat ctx=477..527:50 gen=300 THINKING decoding chunk=19.79 t/s avg=17.73 t/s 16.923s
+0920 12:09:04 ds4-server: chat ctx=527..577:50 gen=350 THINKING decoding chunk=20.65 t/s avg=18.09 t/s 19.344s
+0920 12:09:07 ds4-server: chat ctx=577..627:50 gen=400 THINKING decoding chunk=20.87 t/s avg=18.40 t/s 21.740s
+0920 12:09:09 ds4-server: chat ctx=627..677:50 gen=450 decoding chunk=20.60 t/s avg=18.62 t/s 24.167s
+0920 12:09:10 ds4-server: chat ctx=677..692:15 gen=465 decoding chunk=20.49 t/s avg=18.68 t/s 24.899s
+0920 12:09:10 ds4-server: thinking live checkpoint remembered ctx=0..227:227 live=692 visible=284
+0920 12:09:10 ds4-server: chat ctx=0..227:227 gen=465 finish=stop 54.083s
+0920 12:09:10 ds4-server: vision embedding cache hit
+0920 12:09:10 ds4-server: live kv cache miss live=692 prompt=227 common=227 vision=mismatch reason=token-mismatch
+0920 12:09:10 ds4-server: chat ctx=0..227:227 prompt start
+0920 12:09:40 ds4-server: chat ctx=0..227:227 prompt done 29.744s
+0920 12:09:44 ds4-server: chat ctx=227..277:50 gen=50 THINKING decoding chunk=10.68 t/s avg=10.68 t/s 4.682s
+0920 12:09:47 ds4-server: chat ctx=277..327:50 gen=100 THINKING decoding chunk=19.75 t/s avg=13.86 t/s 7.213s
+0920 12:09:50 ds4-server: chat ctx=327..377:50 gen=150 THINKING decoding chunk=16.13 t/s avg=14.54 t/s 10.313s
+0920 12:09:53 ds4-server: chat ctx=377..427:50 gen=200 THINKING decoding chunk=18.10 t/s avg=15.30 t/s 13.076s
+0920 12:09:55 ds4-server: chat ctx=427..477:50 gen=250 THINKING decoding chunk=19.20 t/s avg=15.94 t/s 15.679s
+0920 12:09:58 ds4-server: chat ctx=477..527:50 gen=300 THINKING decoding chunk=19.61 t/s avg=16.46 t/s 18.229s
+0920 12:10:00 ds4-server: chat ctx=527..577:50 gen=350 THINKING decoding chunk=19.65 t/s avg=16.85 t/s 20.774s
+0920 12:10:03 ds4-server: chat ctx=577..627:50 gen=400 THINKING decoding chunk=18.57 t/s avg=17.05 t/s 23.467s
+0920 12:10:06 ds4-server: chat ctx=627..677:50 gen=450 THINKING decoding chunk=18.99 t/s avg=17.24 t/s 26.099s
+0920 12:10:07 ds4-server: chat ctx=677..707:30 gen=480 decoding chunk=19.28 t/s avg=17.36 t/s 27.655s
+0920 12:10:07 ds4-server: thinking live checkpoint remembered ctx=0..227:227 live=707 visible=271
+0920 12:10:07 ds4-server: chat ctx=0..227:227 gen=480 finish=stop 57.401s
+0920 12:10:23 ds4-server: live kv cache miss live=707 prompt=17 common=2 vision=mismatch reason=token-mismatch
+0920 12:10:23 ds4-server: chat ctx=0..17:17 prompt start
+0920 12:10:26 ds4-server: chat ctx=0..17:17 prompt done 3.335s
+0920 12:10:29 ds4-server: chat ctx=17..67:50 gen=50 THINKING decoding chunk=16.94 t/s avg=16.94 t/s 2.952s
+0920 12:10:32 ds4-server: chat ctx=67..117:50 gen=100 THINKING decoding chunk=17.19 t/s avg=17.06 t/s 5.861s
+0920 12:10:34 ds4-server: chat ctx=117..167:50 gen=150 decoding chunk=19.65 t/s avg=17.85 t/s 8.405s
+0920 12:10:35 ds4-server: chat ctx=167..168:1 gen=151 decoding chunk=17.80 t/s avg=17.85 t/s 8.461s
+0920 12:10:35 ds4-server: thinking live checkpoint remembered ctx=0..17:17 live=168 visible=179
+0920 12:10:35 ds4-server: chat ctx=0..17:17 gen=151 finish=stop 11.797s
+0920 12:10:43 ds4-server: live kv cache miss live=168 prompt=3333 common=2 vision=match reason=token-mismatch
+0920 12:10:43 ds4-server: chat ctx=0..3333:3333 prompt start
+0920 12:11:12 ds4-server: kv cache stored tokens=2048 trimmed=1285 reason=cold key=token-text size=49.77 MiB save=37.6 ms
+0920 12:11:12 ds4-server: chat ctx=0..3333:3333 prefill chunk 2048/3333 (61.4%) chunk=0.00 t/s avg=69.21 t/s 29.593s
+0920 12:11:42 ds4-server: chat ctx=0..3333:3333 prefill chunk 3333/3333 (100.0%) chunk=42.74 t/s avg=55.87 t/s 59.661s
+0920 12:11:42 ds4-server: chat ctx=0..3333:3333 prompt done 59.662s
+0920 12:11:48 ds4-server: chat ctx=3333..3383:50 gen=50 THINKING decoding chunk=8.63 t/s avg=8.63 t/s 5.792s
+0920 12:11:52 ds4-server: chat ctx=3383..3433:50 gen=100 THINKING decoding chunk=13.33 t/s avg=10.48 t/s 9.542s
+0920 12:11:55 ds4-server: chat ctx=3433..3483:50 gen=150 THINKING decoding chunk=14.81 t/s avg=11.61 t/s 12.919s
+0920 12:11:58 ds4-server: chat ctx=3483..3533:50 gen=200 THINKING decoding chunk=17.48 t/s avg=12.67 t/s 15.780s
+0920 12:12:01 ds4-server: chat ctx=3533..3583:50 gen=250 THINKING decoding chunk=17.99 t/s avg=13.47 t/s 18.559s
+0920 12:12:04 ds4-server: chat ctx=3583..3633:50 gen=300 THINKING decoding chunk=17.88 t/s avg=14.05 t/s 21.356s
+0920 12:12:07 ds4-server: chat ctx=3633..3683:50 gen=350 THINKING decoding chunk=14.37 t/s avg=14.09 t/s 24.836s
+0920 12:12:10 ds4-server: chat ctx=3683..3733:50 gen=400 THINKING decoding chunk=14.62 t/s avg=14.16 t/s 28.255s
+0920 12:12:14 ds4-server: chat ctx=3733..3783:50 gen=450 THINKING decoding chunk=15.45 t/s avg=14.29 t/s 31.490s
+0920 12:12:17 ds4-server: chat ctx=3783..3833:50 gen=500 THINKING decoding chunk=14.79 t/s avg=14.34 t/s 34.870s
+0920 12:12:18 ds4-server: chat ctx=3833..3845:12 gen=512 THINKING decoding chunk=18.17 t/s avg=14.41 t/s 35.530s
+ds4-server: thinking not closed, ignoring incomplete DSML in reasoning
+0920 12:12:18 ds4-server: chat ctx=0..3333:3333 gen=512 THINKING finish=length 95.193s
+0920 12:12:30 ds4-server: shutdown requested, draining requests
+0920 12:12:30 ds4-server: persisting resident KV cache before shutdown slot=0 tokens=3845
+0920 12:12:30 ds4-server: kv cache stored tokens=3845 trimmed=0 reason=shutdown key=token-text size=73.35 MiB save=36.3 ms

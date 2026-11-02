@@ -1,0 +1,74 @@
+[
+ {
+  "label": "7336slots",
+  "copies": 9,
+  "prompt_tokens": 1054,
+  "ttft": 31.635849952697754,
+  "prefill_tps": 33.316632920435254,
+  "decode_tps": 10.26,
+  "wall": 46.65875506401062
+ },
+ {
+  "label": "7336slots",
+  "copies": 9,
+  "prompt_tokens": 1053,
+  "ttft": 30.75233268737793,
+  "prefill_tps": 34.24130490212198,
+  "decode_tps": 12.63,
+  "wall": 45.51412487030029
+ },
+ {
+  "label": "7336slots",
+  "copies": 9,
+  "prompt_tokens": 1054,
+  "ttft": 31.633422136306763,
+  "prefill_tps": 33.31918992065952,
+  "decode_tps": 12.4,
+  "wall": 46.693608045578
+ },
+ {
+  "label": "7336slots",
+  "copies": 9,
+  "prompt_tokens": 1054,
+  "ttft": 31.169953107833862,
+  "prefill_tps": 33.81461615786329,
+  "decode_tps": 12.27,
+  "wall": 46.406424045562744
+ },
+ {
+  "label": "7336slots",
+  "copies": 9,
+  "prompt_tokens": 1055,
+  "ttft": 31.36941909790039,
+  "prefill_tps": 33.631480286818984,
+  "decode_tps": 12.32,
+  "wall": 46.50752806663513
+ },
+ {
+  "label": "7336slots",
+  "copies": 9,
+  "prompt_tokens": 1052,
+  "ttft": 31.546324968338013,
+  "prefill_tps": 33.347783016115415,
+  "decode_tps": 12.88,
+  "wall": 46.14127588272095
+ },
+ {
+  "label": "7336slots",
+  "copies": 78,
+  "prompt_tokens": 8574,
+  "ttft": 77.93340110778809,
+  "prefill_tps": 110.01701296394695,
+  "decode_tps": 11.81,
+  "wall": 93.7295413017273
+ },
+ {
+  "label": "7336slots",
+  "copies": 78,
+  "prompt_tokens": 8576,
+  "ttft": 82.50920128822327,
+  "prefill_tps": 103.93992265228815,
+  "decode_tps": 11.73,
+  "wall": 98.3645761013031
+ }
+]

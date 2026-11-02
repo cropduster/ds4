@@ -1,0 +1,30 @@
+ds4: Metal device Apple M4 Max, 128.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 1.865 ms, residency requested in 634.208 ms, warmup 3.942 ms (mapped 92026.06 MiB from offset 9.08 MiB)
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: Metal model views created in 0.039 ms, residency requested in 6.666 ms, warmup 0.907 ms (mapped 1075.05 MiB from offset 0.03 MiB)
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 4.38 GiB (raw 0.00 + compressed 4.38) + buffers 3.16 GiB + resident model 89.87 GiB = 97.42 GiB planned
+ds4: memory detail: ctx=393216 prefill_cap=2048 raw_kv_rows=0 compressed_kv_rows=393216 backend=metal
+0921 14:27:43 ds4-server: context buffers 7728.53 MiB (ctx=393216, backend=metal, prefill_chunk=2048, raw_kv_rows=0, compressed_kv_rows=393216)
+ds4: GLM session ctx=393216 (model max=1048576); prefill/work cap=4096; dense attention limit=2051
+ds4: GLM graph using compact DSA KV only; expanded full-attention KV cache is skipped
+ds4: GLM graph allocating compact DSA cache: rows=393216 logical_ctx=393216 kv_layers=45 indexer_layers=11 f16 4.38 GiB
+ds4: GLM compact indexed prefill chunk=2048 score_rows=682 score_scratch=255.75 MiB
+0921 14:27:43 ds4-server: KV disk cache /Users/michaelkuebbeler/.ds4/glm53-server-kv (budget=32768 MiB, cross-quant=accept, min=512, cold_max=30000, continued=10000, trim=32, align=2048, hit_half_life=21600s)
+0921 14:27:43 ds4-server: listening on http://0.0.0.0:8008
+0921 14:28:04 ds4-server: chat ctx=0..230:230 TOOLS prompt start
+0921 14:28:05 ds4-server: chat ctx=0..230:230 TOOLS prefill chunk 230/230 (100.0%) chunk=0.00 t/s avg=123.82 t/s 1.858s
+0921 14:28:05 ds4-server: chat ctx=0..230:230 TOOLS prompt done 1.858s
+0921 14:28:08 ds4-server: chat ctx=230..280:50 gen=50 TOOLS DSML_START decoding chunk=24.55 t/s avg=24.55 t/s 2.037s
+0921 14:28:09 ds4-server: chat ctx=280..324:44 gen=94 TOOLS DSML_START DSML_END decoding chunk=30.96 t/s avg=27.19 t/s 3.458s
+0921 14:28:09 ds4-server: tool calls ctx=0..230:230 n=1 raw_tool_text=1 ids=[call_5788cc6baf42d545a7b553513b00b92a] names=[execute_code]
+0921 14:28:09 ds4-server: thinking live checkpoint remembered ctx=0..230:230 live=324 visible=1050
+0921 14:28:09 ds4-server: chat ctx=0..230:230 gen=94 TOOLS DSML_START DSML_END finish=tool_calls 5.316s
+0921 14:28:09 ds4-server: live kv cache miss live=324 prompt=304 common=230 vision=match reason=token-mismatch
+0921 14:28:09 ds4-server: chat ctx=0..304:304 TOOLS prompt start
+0921 14:28:11 ds4-server: chat ctx=0..304:304 TOOLS prefill chunk 304/304 (100.0%) chunk=0.00 t/s avg=143.96 t/s 2.112s
+0921 14:28:11 ds4-server: chat ctx=0..304:304 TOOLS prompt done 2.112s
+0921 14:28:12 ds4-server: chat ctx=304..334:30 gen=30 TOOLS decoding chunk=21.29 t/s avg=21.29 t/s 1.409s
+0921 14:28:12 ds4-server: chat ctx=0..304:304 gen=30 TOOLS finish=stop 3.521s

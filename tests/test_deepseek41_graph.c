@@ -311,52 +311,6 @@ done:
     return rc;
 }
 
-static int check_stream_decode_queue(const char *path) {
-    ds4_engine *engine = NULL;
-    ds4_session *control = NULL, *queued = NULL;
-    ds4_tokens tokens = {0};
-    ds4_session_snapshot snap = {0};
-    char err[256] = {0};
-    int rc = 1;
-    ds4_engine_options opt = {.model_path = path, .backend = DS4_BACKEND_METAL,
-        .context_size = 256, .power_percent = 100, .ssd_streaming = true,
-        .ssd_streaming_cache_experts = 512};
-    unsetenv("DS4_METAL_ENABLE_V41_STREAM_DECODE_QUEUE");
-    REQUIRE(ds4_engine_open(&engine, &opt) == 0);
-    REQUIRE(ds4_session_create(&control, engine, 256) == 0);
-    REQUIRE(ds4_session_create(&queued, engine, 256) == 0);
-    for (int i = 0; i < 120; i++) ds4_tokens_push(&tokens, 100 + i);
-    REQUIRE(ds4_session_sync(control, &tokens, err, sizeof(err)) == 0);
-    REQUIRE(ds4_session_save_snapshot(control, &snap, err, sizeof(err)) == 0);
-    REQUIRE(ds4_session_load_snapshot(queued, &snap, err, sizeof(err)) == 0);
-    for (int i = 0; i < 24; i++) {
-        unsetenv("DS4_METAL_ENABLE_V41_STREAM_DECODE_QUEUE");
-        REQUIRE(ds4_session_eval(control, 500 + i, err, sizeof(err)) == 0);
-        setenv("DS4_METAL_ENABLE_V41_STREAM_DECODE_QUEUE", "1", 1);
-        REQUIRE(ds4_session_eval(queued, 500 + i, err, sizeof(err)) == 0);
-        REQUIRE(memcmp(control->logits, queued->logits, DS4_N_VOCAB * sizeof(float)) == 0);
-        for (uint32_t j = 0; j < DS4_N_VOCAB; j++) REQUIRE(isfinite(queued->logits[j]));
-        REQUIRE(memcmp(&control->ds41_graph.history, &queued->ds41_graph.history,
-                       sizeof(control->ds41_graph.history)) == 0);
-        ds41_state_span a[54], b[54];
-        const uint32_t n = ds41_state_spans(&control->ds41_graph, 121 + i, a);
-        REQUIRE(n == ds41_state_spans(&queued->ds41_graph, 121 + i, b));
-        for (uint32_t j = 0; j < n; j++) {
-            REQUIRE(a[j].bytes == b[j].bytes);
-            REQUIRE(memcmp(ds4_gpu_tensor_contents(a[j].tensor),
-                           ds4_gpu_tensor_contents(b[j].tensor), a[j].bytes) == 0);
-        }
-    }
-    puts("V4.1 stream decode queue under cache eviction: exact logits/history/cache spans across positions 121-144: PASS");
-    rc = 0;
-done:
-    unsetenv("DS4_METAL_ENABLE_V41_STREAM_DECODE_QUEUE");
-    ds4_session_snapshot_free(&snap);
-    ds4_tokens_free(&tokens);
-    ds4_session_free(control); ds4_session_free(queued); ds4_engine_close(engine);
-    return rc;
-}
-
 static int check_sessions(const char *path) {
     int cwd_fd = open(".", O_RDONLY);
     ds4_engine *engine = NULL;
@@ -1255,7 +1209,69 @@ done:
     return rc;
 }
 
-static int check_decoder_suffix(const char *path, const char *prompt_path) {
+static int check_decode_control(const char *path, const char *prompt_path, bool streaming, const char *disable) {
+    ds4_engine *engine = NULL;
+    ds4_session *control = NULL, *candidate = NULL;
+    ds4_tokens tokens = {0};
+    char *prompt = NULL, err[256] = "";
+    size_t prompt_bytes;
+    int rc = 1;
+    ds4_engine_options opt = {.model_path = path, .backend = DS4_BACKEND_METAL,
+        .context_size = 4096, .power_percent = 100, .ssd_streaming = streaming,
+        .ssd_streaming_cache_bytes = UINT64_C(64) << 30};
+    REQUIRE(imatrix_read_text_file(prompt_path, &prompt, &prompt_bytes));
+    REQUIRE(ds4_engine_open(&engine, &opt) == 0);
+    ds4_tokenize_text(engine, prompt, &tokens);
+    REQUIRE(tokens.len > 2112);
+    const int prefixes[] = {511, 2047};
+    for (unsigned pass = 0; pass < sizeof(prefixes) / sizeof(prefixes[0]); pass++) {
+        const int prefix = prefixes[pass];
+        REQUIRE(ds4_session_create(&control, engine, 4096) == 0);
+        REQUIRE(ds4_session_create(&candidate, engine, 4096) == 0);
+        ds4_tokens input = {.v = tokens.v, .len = prefix, .cap = prefix};
+        setenv(disable, "1", 1);
+        REQUIRE(ds4_session_sync(control, &input, err, sizeof(err)) == 0);
+        unsetenv(disable);
+        REQUIRE(ds4_session_sync(candidate, &input, err, sizeof(err)) == 0);
+        for (int step = 0; step <= 64; step++) {
+            ds41_gpu_graph *a = &control->ds41_graph, *b = &candidate->ds41_graph;
+            ds41_state_span sa[64], sb[64];
+            const uint32_t n = ds41_state_spans(a, a->pos, sa);
+            REQUIRE(a->pos == b->pos && n == ds41_state_spans(b, b->pos, sb));
+            REQUIRE(!memcmp(&a->history, &b->history, sizeof(a->history)));
+            REQUIRE(!memcmp(control->logits, candidate->logits, DS4_N_VOCAB * sizeof(float)));
+            for (uint32_t j = 0; j < n; j++) {
+                REQUIRE(sa[j].bytes == sb[j].bytes);
+                if (memcmp(ds4_gpu_tensor_contents(sa[j].tensor),
+                           ds4_gpu_tensor_contents(sb[j].tensor), (size_t)sa[j].bytes)) {
+                    fprintf(stderr, "decode queue state mismatch: pos=%u span=%u\n", a->pos, j);
+                    goto done;
+                }
+            }
+            if (step == 64) break;
+            const int token = tokens.v[prefix + step];
+            setenv(disable, "1", 1);
+            REQUIRE(ds4_session_eval(control, token, err, sizeof(err)) == 0);
+            unsetenv(disable);
+            REQUIRE(ds4_session_eval(candidate, token, err, sizeof(err)) == 0);
+        }
+        fprintf(stderr, "V4.1 decode control %s %s prefix=%d: 65 exact logits/history/KV states PASS\n",
+            disable,
+            streaming ? "SSD" : "resident", prefix);
+        ds4_session_free(candidate); candidate = NULL;
+        ds4_session_free(control); control = NULL;
+    }
+    rc = 0;
+done:
+    if (err[0]) fprintf(stderr, "%s\n", err);
+    unsetenv(disable);
+    if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
+    ds4_session_free(candidate); ds4_session_free(control); ds4_engine_close(engine);
+    ds4_tokens_free(&tokens); free(prompt);
+    return rc;
+}
+
+static int check_decoder_suffix(const char *path, const char *prompt_path, bool wider, bool streaming) {
     ds4_engine *engine = NULL;
     ds4_session *control = NULL, *candidate = NULL;
     ds4_tokens tokens = {0};
@@ -1263,30 +1279,37 @@ static int check_decoder_suffix(const char *path, const char *prompt_path) {
     size_t prompt_bytes;
     int rc = 1;
     ds4_engine_options opt = {.model_path = path, .backend = DS4_BACKEND_METAL,
-        .context_size = 18432, .power_percent = 100, .ssd_streaming = true,
+        .context_size = wider ? 32768 : 18432, .power_percent = 100, .ssd_streaming = streaming,
         .ssd_streaming_cache_bytes = UINT64_C(64) << 30};
     /* Hold arithmetic fixed to isolate dependency pruning from GEMM tiling. */
-    setenv("DS4_METAL_DISABLE_V41_BATCH_MOE", "1", 1);
-    setenv("DS4_METAL_DISABLE_V41_BATCH_ATTN", "1", 1);
+    if (!wider) {
+        setenv("DS4_METAL_DISABLE_V41_BATCH_MOE", "1", 1);
+        setenv("DS4_METAL_DISABLE_V41_BATCH_ATTN", "1", 1);
+    }
     REQUIRE(imatrix_read_text_file(prompt_path, &prompt, &prompt_bytes));
     REQUIRE(ds4_engine_open(&engine, &opt) == 0);
     ds4_encode_chat_prompt(engine, NULL, prompt, DS4_THINK_NONE, &tokens);
-    REQUIRE(tokens.len > 16386);
-    REQUIRE(ds4_session_create(&control, engine, 18432) == 0);
-    REQUIRE(ds4_session_create(&candidate, engine, 18432) == 0);
+    REQUIRE(tokens.len > (wider ? 23852 : 16386));
+    REQUIRE(ds4_session_create(&control, engine, opt.context_size) == 0);
+    REQUIRE(ds4_session_create(&candidate, engine, opt.context_size) == 0);
     ds41_gpu_graph *a = &control->ds41_graph, *b = &candidate->ds41_graph;
-    for (uint32_t pass = 0; pass < 2; pass++) {
-        const uint32_t start = a->pos, count = 8192;
-        setenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX", "1", 1);
-        double t0 = now_sec();
-        REQUIRE(ds41_graph_prefill(a, &engine->model, &engine->weights,
-            tokens.v + start, count, NULL, NULL, (int)(start + count), NULL, NULL));
-        const double reference = now_sec() - t0;
-        unsetenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX");
-        t0 = now_sec();
-        REQUIRE(ds41_graph_prefill(b, &engine->model, &engine->weights,
-            tokens.v + start, count, NULL, NULL, (int)(start + count), NULL, NULL));
-        const double candidate_time = now_sec() - t0;
+    for (uint32_t run = 0; run < (wider && !streaming ? 8u : 2u); run++) {
+        const unsigned trial = run / 2, pass = run % 2;
+        if (trial && !pass) { ds41_graph_reset(a); ds41_graph_reset(b); }
+        const uint32_t start = a->pos, count = wider ? (pass ? 15894u : 7956u) : 8192u;
+        const char *disable = wider ? "DS4_METAL_DISABLE_V41_WIDER_SHORT_CHUNKS" :
+                                     "DS4_METAL_DISABLE_V41_DECODER_SUFFIX";
+        double elapsed[2];
+        /* Reverse execution order between trials to expose warm-order bias. */
+        for (unsigned order = 0; order < 2; order++) {
+            const unsigned which = (trial + order) % 2;
+            if (which) unsetenv(disable); else setenv(disable, "1", 1);
+            const double t0 = now_sec();
+            REQUIRE(ds41_graph_prefill(which ? b : a, &engine->model, &engine->weights,
+                tokens.v + start, count, NULL, NULL, (int)(start + count), NULL, NULL));
+            elapsed[which] = now_sec() - t0;
+        }
+        unsetenv(disable);
         ds41_state_span sa[64], sb[64];
         const uint32_t n = ds41_state_spans(a, a->pos, sa);
         REQUIRE(a->pos == b->pos && n == ds41_state_spans(b, b->pos, sb));
@@ -1302,138 +1325,20 @@ static int check_decoder_suffix(const char *path, const char *prompt_path) {
         REQUIRE(ds41_graph_logits(a, &engine->model, &engine->weights, control->logits));
         REQUIRE(ds41_graph_logits(b, &engine->model, &engine->weights, candidate->logits));
         REQUIRE(!memcmp(control->logits, candidate->logits, DS4_N_VOCAB * sizeof(float)));
-        fprintf(stderr, "V4.1 decoder suffix start=%u count=%u: exact state/logits, %.2f -> %.2f t/s\n",
-                start, count, count / reference, count / candidate_time);
+        fprintf(stderr, "V4.1 %s trial=%u start=%u count=%u: exact state/logits, %.2f -> %.2f t/s\n",
+                wider ? "wider encoder" : "decoder suffix", trial + 1,
+                start, count, count / elapsed[0], count / elapsed[1]);
         REQUIRE(ds41_graph_step(a, &engine->model, &engine->weights, tokens.v[a->pos], control->logits));
         REQUIRE(ds41_graph_step(b, &engine->model, &engine->weights, tokens.v[b->pos], candidate->logits));
         REQUIRE(!memcmp(control->logits, candidate->logits, DS4_N_VOCAB * sizeof(float)));
     }
-    puts("V4.1 exact decoder dependency suffix: initial/continued prefill and decode PASS");
+    puts("V4.1 exact prefill state and logits, initial/continued prefill and decode PASS");
     rc = 0;
 done:
     unsetenv("DS4_METAL_DISABLE_V41_BATCH_MOE");
     unsetenv("DS4_METAL_DISABLE_V41_BATCH_ATTN");
     unsetenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX");
-    if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
-    ds4_tokens_free(&tokens);
-    free(prompt);
-    ds4_session_free(candidate); ds4_session_free(control); ds4_engine_close(engine);
-    return rc;
-}
-
-/* The decoder suffix must reproduce full prefill with the DEFAULT batched
- * kernels, not only with the arithmetic held fixed: the batched attention
- * core splits raw from compressed context by chunk start and count, which is
- * why the suffix aligns its chunks to the full-prefill grid. On a mismatch
- * this prints the cache class and the rows that moved.
- * Usage: --decoder-suffix-exact PROMPT_FILE [COUNT] */
-static void suffix_span_label(uint32_t j, uint32_t pos, char *buf, size_t cap) {
-    if (j < 40u) { snprintf(buf, cap, "window[%u]", j); return; }
-    uint32_t k = j - 40u;
-    static const char *names[2] = {"compressed", "index_cache"};
-    const bool previous = (pos & 1u) != 0;
-    for (uint32_t i = 0; i < 4u; i++) {
-        for (uint32_t m = 0; m < 2u; m++, k--)
-            if (!k) { snprintf(buf, cap, "%s[%u]", names[m], i); return; }
-        if (i < 3u && previous)
-            for (uint32_t m = 0; m < 2u; m++, k--)
-                if (!k) {
-                    snprintf(buf, cap, "%s[%u]",
-                             m ? "previous_score" : "previous_kv", i);
-                    return;
-                }
-    }
-    snprintf(buf, cap, "span[%u]", j);
-}
-
-static int check_decoder_suffix_exact(const char *path, const char *prompt_path, uint32_t count) {
-    ds4_engine *engine = NULL;
-    ds4_session *control = NULL, *candidate = NULL;
-    ds4_tokens tokens = {0};
-    char *prompt = NULL;
-    size_t prompt_bytes;
-    int rc = 1;
-    const uint32_t ctx = count > 8192u ? 16384u : 8192u;
-    ds4_engine_options opt = {.model_path = path, .backend = DS4_BACKEND_METAL,
-        .context_size = ctx, .power_percent = 100, .ssd_streaming = true,
-        .ssd_streaming_cache_bytes = UINT64_C(64) << 30};
-    REQUIRE(imatrix_read_text_file(prompt_path, &prompt, &prompt_bytes));
-    REQUIRE(ds4_engine_open(&engine, &opt) == 0);
-    ds4_encode_chat_prompt(engine, NULL, prompt, DS4_THINK_NONE, &tokens);
-    REQUIRE(tokens.len > (int)count);
-    tokens.len = (int)count;
-    REQUIRE(ds4_session_create(&control, engine, ctx) == 0);
-    REQUIRE(ds4_session_create(&candidate, engine, ctx) == 0);
-    ds41_gpu_graph *a = &control->ds41_graph, *b = &candidate->ds41_graph;
-
-    setenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX", "1", 1);
-    double t0 = now_sec();
-    REQUIRE(ds41_graph_prefill(a, &engine->model, &engine->weights,
-        tokens.v, count, NULL, NULL, (int)count, NULL, NULL));
-    const double reference = now_sec() - t0;
-    unsetenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX");
-    t0 = now_sec();
-    REQUIRE(ds41_graph_prefill(b, &engine->model, &engine->weights,
-        tokens.v, count, NULL, NULL, (int)count, NULL, NULL));
-    const double candidate_time = now_sec() - t0;
-
-    ds41_state_span sa[64], sb[64];
-    const uint32_t n = ds41_state_spans(a, a->pos, sa);
-    REQUIRE(a->pos == count && b->pos == count && n == ds41_state_spans(b, b->pos, sb));
-    uint32_t mismatched = 0, first_bad = UINT32_MAX;
-    for (uint32_t j = 0; j < n; j++) {
-        char label[64];
-        suffix_span_label(j, a->pos, label, sizeof(label));
-        REQUIRE(sa[j].bytes == sb[j].bytes);
-        const uint8_t *x = ds4_gpu_tensor_contents(sa[j].tensor);
-        const uint8_t *y = ds4_gpu_tensor_contents(sb[j].tensor);
-        if (!memcmp(x, y, (size_t)sa[j].bytes)) continue;
-        if (first_bad == UINT32_MAX) first_bad = j;
-        uint64_t first_byte = 0, changed = 0, first_row = UINT64_MAX, last_row = 0;
-        const uint64_t row_floats = strncmp(label, "index_cache", 11) == 0 ? 128u : 512u;
-        double max_abs = 0.0;
-        const uint64_t nfloats = sa[j].bytes / sizeof(float);
-        for (uint64_t i = 0; i < nfloats; i++) {
-            const float xf = ((const float *)x)[i], yf = ((const float *)y)[i];
-            if (xf != yf) {
-                if (!changed) first_byte = i * sizeof(float);
-                changed++;
-                const uint64_t row = i / row_floats;
-                if (row < first_row) first_row = row;
-                if (row > last_row) last_row = row;
-                const double d = fabs((double)yf - (double)xf);
-                if (isfinite(d) && d > max_abs) max_abs = d;
-            }
-        }
-        mismatched++;
-        if (mismatched <= 24u)
-            fprintf(stderr,
-                "DIAG %-16s bytes=%llu changed=%llu/%llu first_byte=%llu rows=[%llu,%llu] max_abs=%.9g\n",
-                label, (unsigned long long)sa[j].bytes, (unsigned long long)changed,
-                (unsigned long long)nfloats, (unsigned long long)first_byte,
-                (unsigned long long)first_row, (unsigned long long)last_row, max_abs);
-    }
-    REQUIRE(ds41_graph_logits(a, &engine->model, &engine->weights, control->logits));
-    REQUIRE(ds41_graph_logits(b, &engine->model, &engine->weights, candidate->logits));
-    uint64_t ldiff = 0;
-    double lmax = 0.0;
-    for (uint32_t i = 0; i < DS4_N_VOCAB; i++)
-        if (control->logits[i] != candidate->logits[i]) {
-            ldiff++;
-            const double d = fabs((double)candidate->logits[i] - control->logits[i]);
-            if (d > lmax) lmax = d;
-        }
-    char first_label[64] = "none";
-    if (first_bad != UINT32_MAX) suffix_span_label(first_bad, a->pos, first_label, sizeof(first_label));
-    fprintf(stderr, "decoder suffix exact count=%u state_spans=%u mismatched=%u first=%s "
-                    "logits_changed=%llu logits_max_abs=%.9g prefill %.2f -> %.2f t/s\n",
-        count, n, mismatched, first_label,
-        (unsigned long long)ldiff, lmax, count / reference, count / candidate_time);
-    REQUIRE(mismatched == 0 && ldiff == 0);
-    puts("V4.1 decoder suffix with default batched kernels: exact state/logits PASS");
-    rc = 0;
-done:
-    unsetenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX");
+    unsetenv("DS4_METAL_DISABLE_V41_WIDER_SHORT_CHUNKS");
     if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
     ds4_tokens_free(&tokens);
     free(prompt);
@@ -2113,12 +2018,14 @@ int main(int argc, char **argv) {
         return check_prefill_alias_fallback(argv[1], argv[3]);
     if (argc == 4 && !strcmp(argv[2], "--chunk-prefill"))
         return check_wide_prefill(argv[1], argv[3], false, false, "DS4_METAL_DISABLE_V41_WIDE_CHUNK");
+    if (argc == 5 && !strcmp(argv[2], "--decode-switch"))
+        return check_decode_control(argv[1], argv[3], false, argv[4]);
     if (argc == 4 && !strcmp(argv[2], "--decoder-suffix"))
-        return check_decoder_suffix(argv[1], argv[3]);
-    if (argc == 4 && !strcmp(argv[2], "--decoder-suffix-exact"))
-        return check_decoder_suffix_exact(argv[1], argv[3], 8406);
-    if (argc == 5 && !strcmp(argv[2], "--decoder-suffix-exact"))
-        return check_decoder_suffix_exact(argv[1], argv[3], (uint32_t)strtoul(argv[4], NULL, 10));
+        return check_decoder_suffix(argv[1], argv[3], false, true);
+    if (argc == 4 && !strcmp(argv[2], "--wider-short-chunks"))
+        return check_decoder_suffix(argv[1], argv[3], true, false);
+    if (argc == 4 && !strcmp(argv[2], "--wider-short-chunks-ssd"))
+        return check_decoder_suffix(argv[1], argv[3], true, true);
     if (argc == 4 && !strcmp(argv[2], "--sweep-partitions"))
         return check_sweep_partitions(argv[1], argv[3]);
     if (argc == 4 && !strcmp(argv[2], "--deferred-decoder"))
@@ -2127,13 +2034,11 @@ int main(int argc, char **argv) {
         return check_chat(argv[2], argv[3], argv[4], argv[5]);
     if (argc == 3 && strcmp(argv[1], "--rope-reference") == 0)
         return check_rope_reference(argv[2]);
-    if (argc == 3 && strcmp(argv[2], "--stream-decode-queue-parity") == 0)
-        return check_stream_decode_queue(argv[1]);
     if (argc == 3 && strcmp(argv[2], "--session-fixture") == 0)
         return check_sessions(argv[1]);
     if (argc < 3 || argc > 4 ||
         (!strncmp(argv[2], "--", 2) && strcmp(argv[2], "--zero-fixture"))) {
-        fprintf(stderr, "usage: %s MODEL (--zero-fixture | --session-fixture | --stream-decode-queue-parity | "
+        fprintf(stderr, "usage: %s MODEL (--zero-fixture | --session-fixture | "
                         "--long-sessions PROMPT_FILE | --prefill-parity PROMPT_FILE | "
                         "--thread-prefill PROMPT_FILE | --thread-sessions PROMPT_FILE | "
                         "--encoder-parity PROMPT_FILE | --encoder-long-parity PROMPT_FILE | "
@@ -2153,9 +2058,8 @@ int main(int argc, char **argv) {
                         "--prefill-alias-fallback PROMPT_FILE | "
                         "--sweep-partitions PROMPT_FILE | "
                         "--deferred-decoder PROMPT_FILE | "
-                        "--decoder-suffix PROMPT_FILE | "
-                        "--decoder-suffix-exact PROMPT_FILE [COUNT] | "
-                        "--session-accounting | --memory-plan | "
+                        "--wider-short-chunks PROMPT_FILE | --wider-short-chunks-ssd PROMPT_FILE | "
+                        "--decoder-suffix PROMPT_FILE | --session-accounting | --memory-plan | "
                         "RENDERED_PROMPT [GENERATE])\n", argv[0]);
         return 2;
     }

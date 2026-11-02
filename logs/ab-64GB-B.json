@@ -1,0 +1,74 @@
+[
+ {
+  "label": "64GB-B",
+  "copies": 9,
+  "prompt_tokens": 1054,
+  "ttft": 29.302608966827393,
+  "prefill_tps": 35.969493405628214,
+  "decode_tps": 10.68,
+  "wall": 45.635117053985596
+ },
+ {
+  "label": "64GB-B",
+  "copies": 9,
+  "prompt_tokens": 1056,
+  "ttft": 30.27677893638611,
+  "prefill_tps": 34.878214826575146,
+  "decode_tps": 11.48,
+  "wall": 46.52576303482056
+ },
+ {
+  "label": "64GB-B",
+  "copies": 9,
+  "prompt_tokens": 1053,
+  "ttft": 30.418134927749634,
+  "prefill_tps": 34.617507039834216,
+  "decode_tps": 11.61,
+  "wall": 46.454824924468994
+ },
+ {
+  "label": "64GB-B",
+  "copies": 9,
+  "prompt_tokens": 1054,
+  "ttft": 30.929726123809814,
+  "prefill_tps": 34.07724969115155,
+  "decode_tps": 11.24,
+  "wall": 47.47089624404907
+ },
+ {
+  "label": "64GB-B",
+  "copies": 9,
+  "prompt_tokens": 1054,
+  "ttft": 31.08140802383423,
+  "prefill_tps": 33.91094763762822,
+  "decode_tps": 11.44,
+  "wall": 47.54565095901489
+ },
+ {
+  "label": "64GB-B",
+  "copies": 9,
+  "prompt_tokens": 1055,
+  "ttft": 30.6304349899292,
+  "prefill_tps": 34.442867048635364,
+  "decode_tps": 11.28,
+  "wall": 47.13610887527466
+ },
+ {
+  "label": "64GB-B",
+  "copies": 78,
+  "prompt_tokens": 8573,
+  "ttft": 73.08512091636658,
+  "prefill_tps": 117.30157783839931,
+  "decode_tps": 11.12,
+  "wall": 89.88385510444641
+ },
+ {
+  "label": "64GB-B",
+  "copies": 78,
+  "prompt_tokens": 8575,
+  "ttft": 73.96354103088379,
+  "prefill_tps": 115.93549849674548,
+  "decode_tps": 11.37,
+  "wall": 90.36391305923462
+ }
+]

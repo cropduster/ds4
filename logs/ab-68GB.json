@@ -1,0 +1,74 @@
+[
+ {
+  "label": "68GB",
+  "copies": 9,
+  "prompt_tokens": 1053,
+  "ttft": 29.60243320465088,
+  "prefill_tps": 35.57140025349543,
+  "decode_tps": 10.91,
+  "wall": 45.13418197631836
+ },
+ {
+  "label": "68GB",
+  "copies": 9,
+  "prompt_tokens": 1053,
+  "ttft": 30.26093101501465,
+  "prefill_tps": 34.79734313123182,
+  "decode_tps": 12.07,
+  "wall": 45.72303795814514
+ },
+ {
+  "label": "68GB",
+  "copies": 9,
+  "prompt_tokens": 1053,
+  "ttft": 31.0157630443573,
+  "prefill_tps": 33.95047861611686,
+  "decode_tps": 11.66,
+  "wall": 47.02450513839722
+ },
+ {
+  "label": "68GB",
+  "copies": 9,
+  "prompt_tokens": 1053,
+  "ttft": 31.186476945877075,
+  "prefill_tps": 33.764634646851604,
+  "decode_tps": 11.9,
+  "wall": 46.85288071632385
+ },
+ {
+  "label": "68GB",
+  "copies": 9,
+  "prompt_tokens": 1054,
+  "ttft": 31.337749004364014,
+  "prefill_tps": 33.633558040598984,
+  "decode_tps": 11.59,
+  "wall": 47.453311920166016
+ },
+ {
+  "label": "68GB",
+  "copies": 9,
+  "prompt_tokens": 1056,
+  "ttft": 31.1267569065094,
+  "prefill_tps": 33.92579584091408,
+  "decode_tps": 12.22,
+  "wall": 46.50106692314148
+ },
+ {
+  "label": "68GB",
+  "copies": 78,
+  "prompt_tokens": 8577,
+  "ttft": 74.53455519676208,
+  "prefill_tps": 115.07414215269377,
+  "decode_tps": 11.6,
+  "wall": 90.55941104888916
+ },
+ {
+  "label": "68GB",
+  "copies": 78,
+  "prompt_tokens": 8574,
+  "ttft": 75.85752987861633,
+  "prefill_tps": 113.02767192287585,
+  "decode_tps": 10.97,
+  "wall": 92.83893585205078
+ }
+]
