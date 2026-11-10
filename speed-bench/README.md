@@ -54,23 +54,21 @@ legacy decode path, including token selection, use:
   --tokens 1024
 ```
 
-For DeepSeek V4.1 Flash single-host SSD streaming, compare the opt-in layer
-queue schedule with the existing per-layer drains:
+For single-host V4.1 Flash SSD decode on Metal, use the per-layer wait
+as the rollback arm. The harness labels the default schedule as control
+and the rollback as candidate.
 
 ```sh
-DS4_METAL_DISABLE_STREAMING_EXPERT_SLABS=1 \
 ./speed-bench/metal_decode_schedule_bench \
-  -m ds4flash.gguf --ssd-streaming \
+  -m gguf/DeepSeek-V4.1-Flash-Q2.gguf --ssd-streaming \
   --prompt-file speed-bench/promessi_sposi.txt --prefix-tokens 2048 \
   --ctx 8257 --tokens 512 --include-selection \
-  --candidate-env DS4_METAL_ENABLE_V41_STREAM_DECODE_QUEUE
+  --candidate-env DS4_METAL_DISABLE_V41_STREAM_DECODE_QUEUE
 ```
 
-Disabling slabs in both arms isolates this comparison from the large-slab
-submission cliff observed on M2 Ultra. The queue flag preserves the drain before
-layer 14 overwrites shared Engram input and the drain at token completion.
-It does not affect resident, quality/imatrix or two-host TP execution. See
-[the M2 Ultra results](v41_decode_queue_m2_ultra.md).
+Expert selection and cache replacement synchronize within each layer.
+The default schedule waits at token completion. For the original M2 Ultra
+measurements, see the [SSD decode queue benchmarks](v41_decode_queue_m2_ultra.md).
 
 ### Metal prefill variant A/B
 
